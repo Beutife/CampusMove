@@ -111,6 +111,7 @@ _Reply with 1-6_
 
 async function handleMenuChoice(phone, choice, session) {
   if (choice === '1') {
+    session.tempData = {};
     session.state = 'FIND_RIDE_FROM';
     return `
 📍 *Find a Ride*
@@ -126,6 +127,7 @@ Send location or type:
   }
 
   if (choice === '2') {
+    session.tempData = {};
     session.state = 'OFFER_RIDE_CHECK';
     return `
 🚗 *Offer a Ride*
@@ -140,13 +142,13 @@ _Reply A or B_
   }
 
   if (choice === '3') {
-    session.state = 'MY_BOOKINGS';
     return await showMyBookings(phone);
   }
 
   if (choice === '4') {
+    session.tempData = {};
     session.state = 'RATE_RIDE_LIST';
-    return await showRidesToRate(phone);
+    return await showRidesToRate(phone, session);
   }
 
   if (choice === '5') {
@@ -351,10 +353,31 @@ Reply "paid" when done, or share this to your friends to split costs!
   if (state === 'SHOW_PAYMENT') {
     if (input.toLowerCase() === 'paid') {
       const bookingId = session.tempData.bookingId;
+      const rideId = session.tempData.selectedRide?.id;
+      const seatsBooked = Number(session.tempData.seats || 0);
+
       await db.collection('bookings').doc(bookingId).update({
         status: 'confirmed',
         paid_at: new Date()
       });
+
+      // Decrement available seats so the next rider doesn't see sold-out rides.
+      if (rideId && seatsBooked > 0) {
+        await db.runTransaction(async (tx) => {
+          const rideRef = db.collection('rides').doc(rideId);
+          const rideSnap = await tx.get(rideRef);
+          if (!rideSnap.exists) return;
+
+          const ride = rideSnap.data() || {};
+          const currentSeats = Number(ride.seats_available || 0);
+          const newSeats = Math.max(currentSeats - seatsBooked, 0);
+
+          tx.update(rideRef, {
+            seats_available: newSeats,
+            status: newSeats > 0 ? 'available' : 'unavailable'
+          });
+        });
+      }
 
       session.state = 'HOME';
       return `
@@ -373,6 +396,265 @@ Time: ${session.tempData.selectedRide.departure_time}
 Type MENU for more options.
       `.trim();
     }
+
+    return 'Reply "paid" when you have completed payment.';
+  }
+
+  // ============================================
+  // OFFER A RIDE (Driver) FLOW
+  // ============================================
+
+  if (state === 'OFFER_RIDE_CHECK') {
+    const choice = (input || '').trim().toLowerCase();
+
+    const wantsRegistered = choice === 'a' || choice === 'yes' || choice === 'registered';
+    const wantsFirstTime = choice === 'b' || choice === 'no' || choice === 'first time' || choice === 'first';
+
+    if (!wantsRegistered && !wantsFirstTime) {
+      return 'Please reply with A or B.';
+    }
+
+    if (wantsRegistered) {
+      const userDoc = await db.collection('users').doc(phone).get();
+      const user = userDoc.data() || {};
+
+      if (userDoc.exists && user.role === 'driver' && user.driver_name) {
+        session.tempData.driver_name = user.driver_name;
+        session.state = 'OFFER_RIDE_FROM';
+        return `
+📍 *Offer a Ride*
+
+Where are you starting from?
+
+🏠 Oduduwa
+🚪 Main gate
+🏬 Campus center
+🏘️ Other (type the area)
+        `.trim();
+      }
+    }
+
+    // First time (or registered but missing profile data)
+    session.state = 'OFFER_RIDE_REGISTER_NAME';
+    return `
+📍 *First-time Driver Registration*
+
+Send your driver name (what riders should see on the ride list):
+        `.trim();
+  }
+
+  if (state === 'OFFER_RIDE_REGISTER_NAME') {
+    const driver_name = (input || '').trim();
+    if (!driver_name) return 'Please send a valid driver name.';
+
+    await db.collection('users').doc(phone).set({
+      phone,
+      role: 'driver',
+      driver_name,
+      updated_at: new Date()
+    }, { merge: true });
+
+    session.tempData.driver_name = driver_name;
+    session.state = 'OFFER_RIDE_FROM';
+    return `
+📍 *Offer a Ride*
+
+Where are you starting from?
+
+🏠 Oduduwa
+🚪 Main gate
+🏬 Campus center
+🏘️ Other (type the area)
+    `.trim();
+  }
+
+  if (state === 'OFFER_RIDE_FROM') {
+    const from = (input || '').trim();
+    if (!from) return 'Please send a valid pickup location/area.';
+
+    session.tempData.from = from;
+    session.state = 'OFFER_RIDE_TO';
+    return `
+✅ *From:* ${from}
+
+Where are you going to?
+
+🏠 Oduduwa
+🚪 Main gate
+🏬 Market
+🎓 Faculty area
+🌆 Other (type area)
+    `.trim();
+  }
+
+  if (state === 'OFFER_RIDE_TO') {
+    const to = (input || '').trim();
+    if (!to) return 'Please send a valid destination/area.';
+
+    session.tempData.to = to;
+    session.state = 'OFFER_RIDE_WHEN';
+    return `
+✅ *To:* ${to}
+
+⏰ When do you want to depart?
+
+1️⃣ Now (immediately)
+2️⃣ Today
+3️⃣ Tomorrow
+4️⃣ This week
+
+_Reply 1-4_
+    `.trim();
+  }
+
+  if (state === 'OFFER_RIDE_WHEN') {
+    const timeChoice = (input || '').trim().toLowerCase();
+    const timeMap = {
+      '1': 'now',
+      'now': 'now',
+      'immediately': 'now',
+      '2': 'today',
+      'today': 'today',
+      'later': 'today',
+      '3': 'tomorrow',
+      'tomorrow': 'tomorrow',
+      '4': 'thisweek',
+      'this week': 'thisweek',
+      'thisweek': 'thisweek'
+    };
+
+    session.tempData.departure_time = timeMap[timeChoice] || 'today';
+    session.state = 'OFFER_RIDE_SEATS';
+    return `
+⏰ Departure: ${session.tempData.departure_time}
+
+How many seats are available? (number)
+    `.trim();
+  }
+
+  if (state === 'OFFER_RIDE_SEATS') {
+    const seats = parseInt((input || '').trim(), 10);
+    if (isNaN(seats) || seats < 1) return 'Please reply with a valid seat number (>= 1).';
+
+    session.tempData.seats = seats;
+    session.state = 'OFFER_RIDE_COST';
+    return `
+🪑 Seats: ${seats}
+
+Cost per seat (₦)?
+    `.trim();
+  }
+
+  if (state === 'OFFER_RIDE_COST') {
+    const cost_per_seat = parseFloat((input || '').trim());
+    if (isNaN(cost_per_seat) || cost_per_seat <= 0) return 'Please reply with a valid cost per seat.';
+
+    session.tempData.cost_per_seat = cost_per_seat;
+    session.state = 'OFFER_RIDE_CONFIRM';
+
+    return `
+🚗 *Confirm your offered ride*
+
+Driver: ${session.tempData.driver_name}
+${session.tempData.from} → ${session.tempData.to}
+Departure: ${session.tempData.departure_time}
+Seats: ${session.tempData.seats}
+Cost/seat: ₦${session.tempData.cost_per_seat}
+
+Reply:
+A) Confirm
+B) Cancel
+    `.trim();
+  }
+
+  if (state === 'OFFER_RIDE_CONFIRM') {
+    const choice = (input || '').trim().toLowerCase();
+    const confirm = choice === 'a' || choice === 'yes';
+    const cancel = choice === 'b' || choice === 'no' || choice === 'cancel';
+
+    if (!confirm && !cancel) return 'Please reply with A or B.';
+    if (cancel) {
+      session.state = 'HOME';
+      return 'Ride offer cancelled. Type MENU to continue.';
+    }
+
+    const ride = {
+      driver_name: session.tempData.driver_name,
+      from: session.tempData.from,
+      to: session.tempData.to,
+      departure_time: session.tempData.departure_time,
+      seats_available: session.tempData.seats,
+      cost_per_seat: session.tempData.cost_per_seat,
+      driver_phone: phone,
+      status: 'available',
+      type: 'carpool',
+      created_at: new Date()
+    };
+
+    await db.collection('rides').add(ride);
+
+    session.state = 'HOME';
+    return '✅ Ride offered successfully! Type MENU to see options.';
+  }
+
+  // ============================================
+  // RATE A RIDE FLOW
+  // ============================================
+
+  if (state === 'RATE_RIDE_LIST') {
+    const rating = parseInt((input || '').trim(), 10);
+    if (![1, 2, 3, 4, 5].includes(rating)) {
+      return 'Please reply with a rating: 1, 2, 3, 4, or 5.';
+    }
+
+    const bookingId = session.tempData.rateBookingId;
+    const rideId = session.tempData.rateRideId;
+    if (!bookingId) {
+      session.state = 'MENU_CHOICE';
+      return 'No ride found to rate. Type MENU and try again.';
+    }
+
+    const bookingSnap = await db.collection('bookings').doc(bookingId).get();
+    if (!bookingSnap.exists) {
+      session.state = 'MENU_CHOICE';
+      return 'That booking was not found (maybe already rated). Type MENU.';
+    }
+
+    await db.collection('bookings').doc(bookingId).update({
+      rider_rating: rating,
+      rated_at: new Date(),
+      status: 'completed'
+    });
+
+    // Update driver rating aggregate (best-effort).
+    const resolvedRideId = rideId || (bookingSnap.data() || {}).ride_id;
+    if (resolvedRideId) {
+      const rideSnap = await db.collection('rides').doc(resolvedRideId).get();
+      const ride = rideSnap.data() || {};
+      const driverPhone = ride.driver_phone;
+
+      if (driverPhone) {
+        const driverSnap = await db.collection('users').doc(driverPhone).get();
+        const driver = driverSnap.data() || {};
+
+        const driver_rating_total = Number(driver.driver_rating_total || 0) + rating;
+        const driver_rating_count = Number(driver.driver_rating_count || 0) + 1;
+        const driver_rating_avg = driver_rating_total / driver_rating_count;
+
+        await db.collection('users').doc(driverPhone).set({
+          phone: driverPhone,
+          role: 'driver',
+          driver_name: ride.driver_name || driver.driver_name,
+          driver_rating_total,
+          driver_rating_count,
+          rating: driver_rating_avg,
+          updated_at: new Date()
+        }, { merge: true });
+      }
+    }
+
+    session.state = 'HOME';
+    return '🙏 Thanks! Your rating has been saved. Type MENU to continue.';
   }
 
   return 'Something went wrong. Type MENU to restart.';
@@ -392,11 +674,17 @@ async function searchRides(from, to, when) {
     const snapshot = await query.get();
     const rides = [];
 
+    const fromQ = normalizeText(from);
+    const toQ = normalizeText(to);
+
     snapshot.forEach(doc => {
       const ride = doc.data();
+      const rideFrom = normalizeText(ride.from);
+      const rideTo = normalizeText(ride.to);
+
       if (
-        ride.from.toLowerCase().includes(from.toLowerCase()) &&
-        ride.to.toLowerCase().includes(to.toLowerCase())
+        rideFrom.includes(fromQ) &&
+        rideTo.includes(toQ)
       ) {
         rides.push({
           id: doc.id,
@@ -410,6 +698,15 @@ async function searchRides(from, to, when) {
     console.error('Search error:', error);
     return [];
   }
+}
+
+function normalizeText(value) {
+  return String(value || '')
+    .toLowerCase()
+    // Keep only letters/numbers/spaces. This removes emojis and symbols.
+    .replace(/[^a-z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 async function createBooking(phone, tempData) {
@@ -436,12 +733,11 @@ async function showMyBookings(phone) {
   try {
     const snapshot = await db.collection('bookings')
       .where('phone', '==', phone)
-      .orderBy('created_at', 'desc')
       .limit(5)
       .get();
 
     if (snapshot.empty) {
-      return 'No bookings yet. Type 1 to find a ride!';
+      return 'No bookings yet. Type MENU to find a ride!';
     }
 
     let response = '📋 *Your Recent Bookings*\n\n';
@@ -483,19 +779,25 @@ Type MENU to go back.
   }
 }
 
-async function showRidesToRate(phone) {
+async function showRidesToRate(phone, session) {
   try {
     const snapshot = await db.collection('bookings')
       .where('phone', '==', phone)
-      .where('status', '==', 'completed')
+      .where('status', '==', 'confirmed')
+      .limit(1)
       .get();
 
     if (snapshot.empty) {
-      return 'No completed rides to rate yet.';
+      session.state = 'MENU_CHOICE';
+      return 'No confirmed rides to rate yet.';
     }
 
     // For simplicity, show first ride
-    const booking = snapshot.docs[0].data();
+    const bookingSnap = snapshot.docs[0];
+    const booking = bookingSnap.data();
+
+    session.tempData.rateBookingId = bookingSnap.id;
+    session.tempData.rateRideId = booking.ride_id;
 
     return `
 ⭐ *Rate Your Ride*
@@ -599,7 +901,7 @@ app.get('/api/admin/stats', async (req, res) => {
     const usersSnapshot = await db.collection('users').get();
 
     const totalRevenue = bookingsSnapshot.docs
-      .filter(d => d.data().status === 'confirmed')
+      .filter(d => ['confirmed', 'completed'].includes(d.data().status))
       .reduce((sum, d) => sum + d.data().total_cost, 0);
 
     res.json({
