@@ -8,9 +8,13 @@
  * - Ride history
  */
 
+require("dotenv").config();
+
 const express = require('express');
 const twilio = require('twilio');
 const admin = require('firebase-admin');
+const { processPayment } = require('./utils/paymentHandler');
+const { getBotWallet, getBalance } = require('./stellarClient');
 require('dotenv').config();
 
 const app = express();
@@ -20,7 +24,7 @@ app.use(express.json());
 // Firebase setup
 const serviceAccount = require('./serviceAccountKey.json');
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
+   credential: admin.credential.cert(serviceAccount)
 });
 const db = admin.firestore();
 
@@ -64,6 +68,40 @@ app.post('/whatsapp', async (req, res) => {
     // Handle universal commands
     if (incoming_msg.toLowerCase() === 'menu') {
       session.state = 'HOME';
+    }
+
+    // Handle special commands
+    if (incoming_msg.startsWith('/status')) {
+      const parts = incoming_msg.split(' ');
+      const txHash = parts[1];
+      if (txHash && /^[a-f0-9]{64}$/.test(txHash)) {
+        const response = `
+✅ *Transaction Verified*
+
+Transaction: ${txHash.substring(0, 16)}...
+🔗 Explorer: https://stellar.expert/explorer/testnet/tx/${txHash}
+
+Type MENU to continue.
+        `.trim();
+        await sendWhatsAppMessage(from, response);
+        res.sendStatus(200);
+        return;
+      }
+    }
+
+    if (incoming_msg === '/wallet') {
+      const balance = await getBalance(process.env.STELLAR_PUBLIC);
+      const response = `
+💰 *Bot Wallet Status*
+
+Balance: ${balance} XLM
+Address: ${process.env.STELLAR_PUBLIC.substring(0, 16)}...
+
+Type MENU to continue.
+      `.trim();
+      await sendWhatsAppMessage(from, response);
+      res.sendStatus(200);
+      return;
     }
 
     // Route to handler
@@ -320,85 +358,125 @@ _Reply A or B_
   if (state === 'CONFIRM_BOOKING') {
     if (input.toLowerCase() === 'a' || input.toLowerCase() === 'yes') {
       const booking = await createBooking(phone, session.tempData);
-      session.state = 'SHOW_PAYMENT';
       session.tempData.bookingId = booking.id;
+      session.state = 'PROCESSING_PAYMENT';
 
-      return `
-✅ *Booking Confirmed!*
+      // Send "processing" message
+      await sendWhatsAppMessage(`whatsapp:${phone}`, `⏳ *Processing payment...*\n\nPlease wait while we process your ₦${session.tempData.totalCost} payment.`);
 
-Booking ID: ${booking.id}
+      try {
+        // Process payment using bot's testnet wallet
+        const botSecret = process.env.STELLAR_SECRET;
+        const botPublic = process.env.STELLAR_PUBLIC;
+        const studentReceiver = 'GDM452LJBTOCIU4EDAY7XRHNYXBHWK3D3IQBS3YQX666LJKB34SWSGTV'; // Demo receiver
 
-💰 *Payment Required: ₦${session.tempData.totalCost}*
+        const paymentResult = await processPayment(botSecret, studentReceiver, session.tempData.totalCost);
 
-*Option 1: Bank Transfer*
-Account: OAU Student Transport
-Bank: First Bank
-Amount: ₦${session.tempData.totalCost}
-Reference: ${booking.id}
+        if (paymentResult.success) {
+          // Update booking with payment details
+          const rideId = session.tempData.selectedRide?.id;
+          const seatsBooked = Number(session.tempData.seats || 0);
 
-*Option 2: USSD*
-Dial: *901*20*${booking.id}*1#
+          await db.collection('bookings').doc(booking.id).update({
+            status: 'confirmed',
+            paid_at: new Date(),
+            txHash: paymentResult.txHash,
+            explorerUrl: paymentResult.explorerUrl
+          });
 
-*Option 3: Meet Driver*
-Driver will contact you on WhatsApp
+          // Decrement available seats
+          if (rideId && seatsBooked > 0) {
+            await db.runTransaction(async (tx) => {
+              const rideRef = db.collection('rides').doc(rideId);
+              const rideSnap = await tx.get(rideRef);
+              if (!rideSnap.exists) return;
 
-Reply "paid" when done, or share this to your friends to split costs!
-      `.trim();
+              const ride = rideSnap.data() || {};
+              const currentSeats = Number(ride.seats_available || 0);
+              const newSeats = Math.max(currentSeats - seatsBooked, 0);
+
+              tx.update(rideRef, {
+                seats_available: newSeats,
+                status: newSeats > 0 ? 'available' : 'unavailable'
+              });
+            });
+          }
+
+          session.state = 'HOME';
+          
+          // Notify driver of confirmed booking with payment
+          const driverPhone = session.tempData.selectedRide.driver_phone;
+          if (driverPhone) {
+            const driverMsg = `
+📱 *New Booking Confirmed!*
+
+✅ Payment Verified
+
+Passenger Seats: ${session.tempData.seats}
+Route: ${session.tempData.selectedRide.from} → ${session.tempData.selectedRide.to}
+Cost: ₦${session.tempData.totalCost}
+Departure: ${session.tempData.selectedRide.departure_time}
+
+💰 Transaction: ${paymentResult.txHash.substring(0, 16)}...
+🔗 Explorer: ${paymentResult.explorerUrl}
+
+Ready to depart?
+Reply: ACCEPT or DECLINE
+            `.trim();
+            
+            await sendWhatsAppMessage(`whatsapp:${driverPhone}`, driverMsg);
+          }
+          
+          // Send success message with transaction details
+          const successMsg = `
+✅ *Payment Confirmed!*
+
+💰 Amount: ₦${session.tempData.totalCost}
+🔗 Transaction: ${paymentResult.txHash.substring(0, 16)}...
+📊 Explorer: ${paymentResult.explorerUrl}
+
+Your ride is confirmed.
+Driver will contact you shortly.
+
+📍 *Pickup details:*
+${session.tempData.selectedRide.driver_name}
+At: ${session.tempData.selectedRide.from}
+Time: ${session.tempData.selectedRide.departure_time}
+
+👋 Have a great ride!
+Type MENU for more options.
+          `.trim();
+
+          return successMsg;
+        } else {
+          session.state = 'CONFIRM_BOOKING';
+          return `
+❌ *Payment Failed*
+
+Error: ${paymentResult.error}
+
+Please try again or contact support.
+Reply: A) Try again | B) Cancel
+          `.trim();
+        }
+      } catch (error) {
+        console.error('Payment error:', error);
+        session.state = 'CONFIRM_BOOKING';
+        return `
+❌ *Payment Error*
+
+${error.message}
+
+Please try again or contact support.
+Reply: A) Try again | B) Cancel
+        `.trim();
+      }
     } else {
       session.state = 'HOME';
       return 'Booking cancelled.\n\nType MENU to start over.';
     }
   }
 
-  if (state === 'SHOW_PAYMENT') {
-    if (input.toLowerCase() === 'paid') {
-      const bookingId = session.tempData.bookingId;
-      const rideId = session.tempData.selectedRide?.id;
-      const seatsBooked = Number(session.tempData.seats || 0);
-
-      await db.collection('bookings').doc(bookingId).update({
-        status: 'confirmed',
-        paid_at: new Date()
-      });
-
-      // Decrement available seats so the next rider doesn't see sold-out rides.
-      if (rideId && seatsBooked > 0) {
-        await db.runTransaction(async (tx) => {
-          const rideRef = db.collection('rides').doc(rideId);
-          const rideSnap = await tx.get(rideRef);
-          if (!rideSnap.exists) return;
-
-          const ride = rideSnap.data() || {};
-          const currentSeats = Number(ride.seats_available || 0);
-          const newSeats = Math.max(currentSeats - seatsBooked, 0);
-
-          tx.update(rideRef, {
-            seats_available: newSeats,
-            status: newSeats > 0 ? 'available' : 'unavailable'
-          });
-        });
-      }
-
-      session.state = 'HOME';
-      return `
-✅ *Payment Received!*
-
-Your ride is confirmed. 
-Driver will contact you shortly.
-
-📍 *Pickup details:*
-Look for ${session.tempData.selectedRide.driver_name}
-At: ${session.tempData.selectedRide.from}
-Time: ${session.tempData.selectedRide.departure_time}
-
-👋 Have a great ride!
-
-Type MENU for more options.
-      `.trim();
-    }
-
-    return 'Reply "paid" when you have completed payment.';
-  }
 
   // ============================================
   // OFFER A RIDE (Driver) FLOW
