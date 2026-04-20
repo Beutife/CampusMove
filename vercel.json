@@ -1,0 +1,7 @@
+{
+    "version": 2,
+    "rewrites": [
+      { "source": "/whatsapp", "destination": "/api/index.js" },
+      { "source": "/(.*)", "destination": "/api/index.js" }
+    ]
+  }

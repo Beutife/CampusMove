@@ -8,8 +8,8 @@
 const express = require('express');
 const twilio = require('twilio');
 const admin = require('firebase-admin');
-const { processPayment } = require('./utils/paymentHandler');
-const { getBotWallet, getBalance } = require('./stellarClient');
+const { processPayment } = require('../utils/paymentHandler');
+const { getBotWallet, getBalance } = require('../stellarClient');
 require('dotenv').config();
 
 const app = express();
@@ -17,7 +17,7 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 // Firebase setup
-const serviceAccount = require('./serviceAccountKey.json');
+const serviceAccount = require('../serviceAccountKey.json');
 admin.initializeApp({
    credential: admin.credential.cert(serviceAccount)
 });
@@ -1181,21 +1181,23 @@ app.get('/api/admin/stats', async (req, res) => {
 // START SERVER
 // ============================================
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`
-╔═══════════════════════════════════╗
-║  🚗 CampusMove Bot Running! 🚗    ║
-╚═══════════════════════════════════╝
+// Check if we are running on Vercel (Vercel sets the VERCEL environment variable)
+if (process.env.NODE_ENV !== 'production') {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`
+  ╔═══════════════════════════════════╗
+  ║  🚗 CampusMove Bot Running! 🚗    ║
+  ╚═══════════════════════════════════╝
+  
+  📱 WhatsApp webhook: POST /whatsapp
+  📊 Admin stats: GET /api/admin/stats
+  ➕ Add ride: POST /api/admin/add-ride
+  
+  🌍 Expose with: ngrok http 3000
+    `);
+  });
+}
 
-📱 WhatsApp webhook: POST /whatsapp
-📊 Admin stats: GET /api/admin/stats
-➕ Add ride: POST /api/admin/add-ride
-
-🌍 Expose with: ngrok http 3000
-
-✨ NEW: Drivers can accept/reject bookings!
-  `);
-});
-
+// CRITICAL: Vercel needs this line to work
 module.exports = app;
