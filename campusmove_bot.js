@@ -1,11 +1,8 @@
 /**
- * CampusMove WhatsApp Bot - Enhanced Version
- * Improvements:
- * - Better error handling
- * - Persistent user sessions
- * - Support for drivers offering rides
- * - Rating system
- * - Ride history
+ * CampusMove WhatsApp Bot - WITH DRIVER ACCEPT/REJECT
+ * ✅ Drivers can accept or reject ride requests
+ * ✅ Passengers get notifications
+ * ✅ Full booking flow
  */
 
 const express = require('express');
@@ -31,7 +28,7 @@ const twilioWhatsAppNumber = process.env.TWILIO_WHATSAPP_NUMBER;
 const client = twilio(accountSid, authToken);
 
 // ============================================
-// SESSION MANAGEMENT (In-memory for now)
+// SESSION MANAGEMENT
 // ============================================
 const userSessions = {};
 
@@ -59,11 +56,16 @@ app.post('/whatsapp', async (req, res) => {
   console.log(`📨 From ${student_phone}: ${incoming_msg}`);
 
   try {
+    if (!incoming_msg) {
+      return res.sendStatus(200);
+    }
+
     const session = await initSession(student_phone);
 
     // Handle universal commands
     if (incoming_msg.toLowerCase() === 'menu') {
       session.state = 'HOME';
+      session.tempData = {};
     }
 
     // Route to handler
@@ -73,17 +75,19 @@ app.post('/whatsapp', async (req, res) => {
       response = showMainMenu();
       session.state = 'MENU_CHOICE';
     } else if (session.state === 'MENU_CHOICE') {
-      const choice = incoming_msg.toLowerCase();
-      response = await handleMenuChoice(student_phone, choice, session);
+      response = await handleMenuChoice(student_phone, incoming_msg, session);
     } else {
       response = await handleState(student_phone, incoming_msg, session);
     }
 
-    await sendWhatsAppMessage(from, response);
+    if (response) {
+      await sendWhatsAppMessage(from, response);
+    }
+
     res.sendStatus(200);
   } catch (error) {
     console.error('❌ Error:', error);
-    await sendWhatsAppMessage(from, '❌ Oops! Something went wrong.\n\nType MENU to restart.');
+    await sendWhatsAppMessage(from, '❌ Oops! Something went wrong.\n\nType MENU to restart.').catch(e => console.error('Error sending error message:', e));
     res.sendStatus(500);
   }
 });
@@ -101,15 +105,18 @@ Find rides, book transport, go anywhere on campus.
 1️⃣ 🔍 Find a ride
 2️⃣ 🚗 Offer a ride (driver)
 3️⃣ 📋 My bookings
-4️⃣ ⭐ Rate a ride
-5️⃣ 👤 My profile
-6️⃣ ❓ Help
+4️⃣ 🔔 Pending requests (driver)
+5️⃣ ⭐ Rate a ride
+6️⃣ 👤 My profile
+7️⃣ ❓ Help
 
-_Reply with 1-6_
+_Reply with 1-7_
   `.trim();
 }
 
 async function handleMenuChoice(phone, choice, session) {
+  choice = String(choice).trim().toLowerCase();
+
   if (choice === '1') {
     session.tempData = {};
     session.state = 'FIND_RIDE_FROM';
@@ -142,34 +149,41 @@ _Reply A or B_
   }
 
   if (choice === '3') {
+    session.state = 'MENU_CHOICE';
     return await showMyBookings(phone);
   }
 
   if (choice === '4') {
-    session.tempData = {};
-    session.state = 'RATE_RIDE_LIST';
-    return await showRidesToRate(phone, session);
+    session.state = 'MENU_CHOICE';
+    return await showPendingRequests(phone, session);
   }
 
   if (choice === '5') {
-    return await showProfile(phone);
+    return await showRidesToRate(phone, session);
   }
 
   if (choice === '6') {
+    session.state = 'MENU_CHOICE';
+    return await showProfile(phone);
+  }
+
+  if (choice === '7') {
+    session.state = 'MENU_CHOICE';
     return showHelp();
   }
 
-  return 'Invalid choice. Please reply with 1-6.';
+  return 'Invalid choice. Please reply with 1-7.';
 }
 
 // ============================================
-// FIND RIDE FLOW
+// FIND RIDE FLOW (STUDENT)
 // ============================================
 
 async function handleState(phone, input, session) {
   const state = session.state;
+  input = String(input).trim();
 
-  // Find ride flow
+  // ========== FIND RIDE FLOW ==========
   if (state === 'FIND_RIDE_FROM') {
     session.tempData.from = input;
     session.state = 'FIND_RIDE_TO';
@@ -205,41 +219,27 @@ _Reply 1-4_
   }
 
   if (state === 'FIND_RIDE_WHEN') {
-    const timeChoice = input.toLowerCase();
     const timeMap = {
-      '1': 'now',
-      'now': 'now',
-      'immediately': 'now',
-      '2': 'today',
-      'today': 'today',
-      'later': 'today',
-      '3': 'tomorrow',
-      'tomorrow': 'tomorrow',
-      '4': 'thisweek'
+      '1': 'now', 'now': 'now', 'immediately': 'now',
+      '2': 'today', 'today': 'today', 'later': 'today',
+      '3': 'tomorrow', 'tomorrow': 'tomorrow',
+      '4': 'thisweek', 'this week': 'thisweek', 'thisweek': 'thisweek'
     };
 
-    const when = timeMap[timeChoice] || 'today';
+    const when = timeMap[input.toLowerCase()] || 'today';
     session.tempData.when = when;
 
     // Search for rides
-    const rides = await searchRides(
-      session.tempData.from,
-      session.tempData.to,
-      when
-    );
+    const rides = await searchRides(session.tempData.from, session.tempData.to, when);
 
     if (rides.length === 0) {
       session.state = 'HOME';
+      session.tempData = {};
       return `
 😔 *No rides found* for:
 ${session.tempData.from} → ${session.tempData.to}
 
-*Would you like to:*
-1. Search again
-2. Post a ride request (other passengers can contact you)
-3. Go back to menu
-
-_Reply 1-3_
+Type MENU to search again or try a different location.
       `.trim();
     }
 
@@ -261,7 +261,7 @@ _Reply 1-3_
 
   if (state === 'FIND_RIDE_SELECT') {
     const rideNum = parseInt(input) - 1;
-    const rides = session.tempData.searchResults;
+    const rides = session.tempData.searchResults || [];
 
     if (isNaN(rideNum) || rideNum < 0 || rideNum >= rides.length) {
       return `Invalid choice. Reply 1-${rides.length}`;
@@ -292,7 +292,7 @@ _Reply: 1, 2, 3, etc._
 
     const ride = session.tempData.selectedRide;
 
-    if (seats > ride.seats_available) {
+    if (seats > (ride.seats_available || 0)) {
       return `❌ Only ${ride.seats_available} seats left. Try again.`;
     }
 
@@ -318,15 +318,62 @@ _Reply A or B_
   }
 
   if (state === 'CONFIRM_BOOKING') {
-    if (input.toLowerCase() === 'a' || input.toLowerCase() === 'yes') {
-      const booking = await createBooking(phone, session.tempData);
-      session.state = 'SHOW_PAYMENT';
-      session.tempData.bookingId = booking.id;
+    const isYes = input.toLowerCase() === 'a' || input.toLowerCase() === 'yes';
+    const isNo = input.toLowerCase() === 'b' || input.toLowerCase() === 'no' || input.toLowerCase() === 'cancel';
 
-      return `
-✅ *Booking Confirmed!*
+    if (!isYes && !isNo) {
+      return 'Please reply with A or B.';
+    }
+
+    if (isNo) {
+      session.state = 'HOME';
+      session.tempData = {};
+      return 'Booking cancelled.\n\nType MENU to start over.';
+    }
+
+    // Create booking in PENDING state
+    const booking = await createBooking(phone, session.tempData);
+    session.state = 'WAITING_DRIVER_ACCEPT';
+    session.tempData.bookingId = booking.id;
+
+    // Notify driver about the pending request
+    const driver_phone = session.tempData.selectedRide.driver_phone;
+    await notifyDriverPendingRequest(driver_phone, booking);
+
+    return `
+⏳ *Waiting for Driver Confirmation*
 
 Booking ID: ${booking.id}
+
+We've sent a request to ${session.tempData.selectedRide.driver_name}!
+
+The driver will accept or reject your request.
+We'll notify you when they respond.
+
+⏱️ This usually takes less than 1 minute.
+
+Type MENU if you want to search for other rides.
+      `.trim();
+  }
+
+  if (state === 'WAITING_DRIVER_ACCEPT') {
+    // Check if booking was accepted
+    const bookingId = session.tempData.bookingId;
+    try {
+      const bookingSnap = await db.collection('bookings').doc(bookingId).get();
+      const booking = bookingSnap.data();
+
+      if (booking.status === 'accepted') {
+        session.state = 'SHOW_PAYMENT';
+        return `
+✅ *Driver Accepted Your Request!*
+
+Booking ID: ${booking.id}
+
+Driver: ${session.tempData.selectedRide.driver_name}
+Pickup: ${booking.from}
+Dropoff: ${booking.to}
+Time: ${session.tempData.selectedRide.departure_time}
 
 💰 *Payment Required: ₦${session.tempData.totalCost}*
 
@@ -339,14 +386,26 @@ Reference: ${booking.id}
 *Option 2: USSD*
 Dial: *901*20*${booking.id}*1#
 
-*Option 3: Meet Driver*
-Driver will contact you on WhatsApp
+Reply "paid" when done!
+        `.trim();
+      }
 
-Reply "paid" when done, or share this to your friends to split costs!
-      `.trim();
-    } else {
-      session.state = 'HOME';
-      return 'Booking cancelled.\n\nType MENU to start over.';
+      if (booking.status === 'rejected') {
+        session.state = 'HOME';
+        session.tempData = {};
+        return `
+❌ *Driver Rejected Your Request*
+
+Sorry, the driver couldn't accept your ride.
+
+Type MENU to find another ride.
+        `.trim();
+      }
+
+      return 'Still waiting for driver response...\n\nType MENU if you want to cancel.';
+    } catch (error) {
+      console.error('Error checking booking:', error);
+      return 'Error checking status. Type MENU to continue.';
     }
   }
 
@@ -361,35 +420,51 @@ Reply "paid" when done, or share this to your friends to split costs!
         paid_at: new Date()
       });
 
-      // Decrement available seats so the next rider doesn't see sold-out rides.
+      // Notify driver that payment is done
+      const driver_phone = session.tempData.selectedRide.driver_phone;
+      await sendWhatsAppMessage(`whatsapp:${driver_phone}`, `
+✅ *Payment Confirmed for Booking ${bookingId}*
+
+Passenger has paid ₦${session.tempData.totalCost}
+
+Ready to pick them up at ${session.tempData.selectedRide.from}
+Time: ${session.tempData.selectedRide.departure_time}
+      `.trim());
+
+      // Decrement available seats
       if (rideId && seatsBooked > 0) {
-        await db.runTransaction(async (tx) => {
-          const rideRef = db.collection('rides').doc(rideId);
-          const rideSnap = await tx.get(rideRef);
-          if (!rideSnap.exists) return;
+        try {
+          await db.runTransaction(async (tx) => {
+            const rideRef = db.collection('rides').doc(rideId);
+            const rideSnap = await tx.get(rideRef);
+            if (!rideSnap.exists) return;
 
-          const ride = rideSnap.data() || {};
-          const currentSeats = Number(ride.seats_available || 0);
-          const newSeats = Math.max(currentSeats - seatsBooked, 0);
+            const ride = rideSnap.data() || {};
+            const currentSeats = Number(ride.seats_available || 0);
+            const newSeats = Math.max(currentSeats - seatsBooked, 0);
 
-          tx.update(rideRef, {
-            seats_available: newSeats,
-            status: newSeats > 0 ? 'available' : 'unavailable'
+            tx.update(rideRef, {
+              seats_available: newSeats,
+              status: newSeats > 0 ? 'available' : 'unavailable'
+            });
           });
-        });
+        } catch (e) {
+          console.error('Error updating seats:', e);
+        }
       }
 
       session.state = 'HOME';
+      session.tempData = {};
+
       return `
 ✅ *Payment Received!*
 
-Your ride is confirmed. 
-Driver will contact you shortly.
+Your ride is confirmed! 
 
 📍 *Pickup details:*
-Look for ${session.tempData.selectedRide.driver_name}
-At: ${session.tempData.selectedRide.from}
-Time: ${session.tempData.selectedRide.departure_time}
+Look for ${session.tempData.selectedRide?.driver_name}
+At: ${session.tempData.selectedRide?.from}
+Time: ${session.tempData.selectedRide?.departure_time}
 
 👋 Have a great ride!
 
@@ -400,21 +475,17 @@ Type MENU for more options.
     return 'Reply "paid" when you have completed payment.';
   }
 
-  // ============================================
-  // OFFER A RIDE (Driver) FLOW
-  // ============================================
-
+  // ========== OFFER A RIDE (DRIVER) FLOW ==========
   if (state === 'OFFER_RIDE_CHECK') {
-    const choice = (input || '').trim().toLowerCase();
+    const choice = input.toLowerCase();
+    const isYes = choice === 'a' || choice === 'yes';
+    const isNo = choice === 'b' || choice === 'no';
 
-    const wantsRegistered = choice === 'a' || choice === 'yes' || choice === 'registered';
-    const wantsFirstTime = choice === 'b' || choice === 'no' || choice === 'first time' || choice === 'first';
-
-    if (!wantsRegistered && !wantsFirstTime) {
+    if (!isYes && !isNo) {
       return 'Please reply with A or B.';
     }
 
-    if (wantsRegistered) {
+    if (isYes) {
       const userDoc = await db.collection('users').doc(phone).get();
       const user = userDoc.data() || {};
 
@@ -422,9 +493,9 @@ Type MENU for more options.
         session.tempData.driver_name = user.driver_name;
         session.state = 'OFFER_RIDE_FROM';
         return `
-📍 *Offer a Ride*
+✅ Welcome back, ${user.driver_name}!
 
-Where are you starting from?
+📍 Where are you starting from?
 
 🏠 Oduduwa
 🚪 Main gate
@@ -434,32 +505,37 @@ Where are you starting from?
       }
     }
 
-    // First time (or registered but missing profile data)
     session.state = 'OFFER_RIDE_REGISTER_NAME';
     return `
 📍 *First-time Driver Registration*
 
-Send your driver name (what riders should see on the ride list):
-        `.trim();
+What's your driver name? (what riders will see)
+
+Example: Tunde, Blessing, Adekunle
+    `.trim();
   }
 
   if (state === 'OFFER_RIDE_REGISTER_NAME') {
-    const driver_name = (input || '').trim();
-    if (!driver_name) return 'Please send a valid driver name.';
+    const driver_name = input.trim();
+    if (!driver_name || driver_name.length < 2) {
+      return 'Please send a valid driver name (at least 2 characters).';
+    }
 
     await db.collection('users').doc(phone).set({
       phone,
       role: 'driver',
       driver_name,
+      created_at: new Date(),
       updated_at: new Date()
     }, { merge: true });
 
     session.tempData.driver_name = driver_name;
     session.state = 'OFFER_RIDE_FROM';
-    return `
-📍 *Offer a Ride*
 
-Where are you starting from?
+    return `
+✅ Welcome, ${driver_name}!
+
+📍 Where are you starting from?
 
 🏠 Oduduwa
 🚪 Main gate
@@ -469,15 +545,18 @@ Where are you starting from?
   }
 
   if (state === 'OFFER_RIDE_FROM') {
-    const from = (input || '').trim();
-    if (!from) return 'Please send a valid pickup location/area.';
+    const from = input.trim();
+    if (!from || from.length < 2) {
+      return 'Please send a valid pickup location.';
+    }
 
     session.tempData.from = from;
     session.state = 'OFFER_RIDE_TO';
+
     return `
 ✅ *From:* ${from}
 
-Where are you going to?
+📍 Where are you going to?
 
 🏠 Oduduwa
 🚪 Main gate
@@ -488,11 +567,14 @@ Where are you going to?
   }
 
   if (state === 'OFFER_RIDE_TO') {
-    const to = (input || '').trim();
-    if (!to) return 'Please send a valid destination/area.';
+    const to = input.trim();
+    if (!to || to.length < 2) {
+      return 'Please send a valid destination.';
+    }
 
     session.tempData.to = to;
     session.state = 'OFFER_RIDE_WHEN';
+
     return `
 ✅ *To:* ${to}
 
@@ -508,46 +590,53 @@ _Reply 1-4_
   }
 
   if (state === 'OFFER_RIDE_WHEN') {
-    const timeChoice = (input || '').trim().toLowerCase();
     const timeMap = {
-      '1': 'now',
-      'now': 'now',
-      'immediately': 'now',
-      '2': 'today',
-      'today': 'today',
-      'later': 'today',
-      '3': 'tomorrow',
-      'tomorrow': 'tomorrow',
-      '4': 'thisweek',
-      'this week': 'thisweek',
-      'thisweek': 'thisweek'
+      '1': 'now', 'now': 'now', 'immediately': 'now',
+      '2': 'today', 'today': 'today',
+      '3': 'tomorrow', 'tomorrow': 'tomorrow',
+      '4': 'thisweek', 'this week': 'thisweek', 'thisweek': 'thisweek'
     };
 
-    session.tempData.departure_time = timeMap[timeChoice] || 'today';
-    session.state = 'OFFER_RIDE_SEATS';
-    return `
-⏰ Departure: ${session.tempData.departure_time}
+    const departure_time = timeMap[input.toLowerCase()];
+    if (!departure_time) {
+      return 'Please reply with 1, 2, 3, or 4.';
+    }
 
-How many seats are available? (number)
+    session.tempData.departure_time = departure_time;
+    session.state = 'OFFER_RIDE_SEATS';
+
+    return `
+⏰ Departure: ${departure_time}
+
+🪑 How many seats are available?
+
+Reply with a number (1, 2, 3, 4, 5, etc.)
     `.trim();
   }
 
   if (state === 'OFFER_RIDE_SEATS') {
-    const seats = parseInt((input || '').trim(), 10);
-    if (isNaN(seats) || seats < 1) return 'Please reply with a valid seat number (>= 1).';
+    const seats = parseInt(input);
+    if (isNaN(seats) || seats < 1) {
+      return 'Please reply with a valid number (1, 2, 3, etc.)';
+    }
 
     session.tempData.seats = seats;
     session.state = 'OFFER_RIDE_COST';
+
     return `
 🪑 Seats: ${seats}
 
-Cost per seat (₦)?
+💰 Cost per seat (₦)?
+
+Reply with a number (e.g., 50, 100, 200)
     `.trim();
   }
 
   if (state === 'OFFER_RIDE_COST') {
-    const cost_per_seat = parseFloat((input || '').trim());
-    if (isNaN(cost_per_seat) || cost_per_seat <= 0) return 'Please reply with a valid cost per seat.';
+    const cost_per_seat = parseFloat(input);
+    if (isNaN(cost_per_seat) || cost_per_seat <= 0) {
+      return 'Please reply with a valid cost (e.g., 50, 100, 200)';
+    }
 
     session.tempData.cost_per_seat = cost_per_seat;
     session.state = 'OFFER_RIDE_CONFIRM';
@@ -568,110 +657,216 @@ B) Cancel
   }
 
   if (state === 'OFFER_RIDE_CONFIRM') {
-    const choice = (input || '').trim().toLowerCase();
-    const confirm = choice === 'a' || choice === 'yes';
-    const cancel = choice === 'b' || choice === 'no' || choice === 'cancel';
+    const choice = input.toLowerCase();
+    const isConfirm = choice === 'a' || choice === 'yes' || choice === 'confirm';
+    const isCancel = choice === 'b' || choice === 'no' || choice === 'cancel';
 
-    if (!confirm && !cancel) return 'Please reply with A or B.';
-    if (cancel) {
+    if (!isConfirm && !isCancel) {
+      return 'Please reply with A or B.';
+    }
+
+    if (isCancel) {
       session.state = 'HOME';
+      session.tempData = {};
       return 'Ride offer cancelled. Type MENU to continue.';
     }
 
+    // Create the ride
     const ride = {
       driver_name: session.tempData.driver_name,
+      driver_phone: phone,
       from: session.tempData.from,
       to: session.tempData.to,
       departure_time: session.tempData.departure_time,
       seats_available: session.tempData.seats,
       cost_per_seat: session.tempData.cost_per_seat,
-      driver_phone: phone,
       status: 'available',
       type: 'carpool',
       created_at: new Date()
     };
 
-    await db.collection('rides').add(ride);
+    try {
+      const docRef = await db.collection('rides').add(ride);
+      session.state = 'HOME';
+      session.tempData = {};
 
-    session.state = 'HOME';
-    return '✅ Ride offered successfully! Type MENU to see options.';
+      return `
+✅ *Ride Offered Successfully!*
+
+Ride ID: ${docRef.id}
+${ride.from} → ${ride.to}
+
+Students can now book your ride!
+
+Type MENU for more options.
+      `.trim();
+    } catch (error) {
+      console.error('Error creating ride:', error);
+      session.state = 'HOME';
+      session.tempData = {};
+      return 'Error creating ride. Type MENU to try again.';
+    }
   }
 
-  // ============================================
-  // RATE A RIDE FLOW
-  // ============================================
+  // ========== PENDING REQUESTS (DRIVER) ==========
+  if (state === 'PENDING_REQUESTS_VIEW') {
+    // Driver is viewing pending booking requests
+    const bookingNum = parseInt(input) - 1;
+    const pendingBookings = session.tempData.pendingBookings || [];
 
+    if (isNaN(bookingNum) || bookingNum < 0 || bookingNum >= pendingBookings.length) {
+      return `Invalid choice. Reply 1-${pendingBookings.length}`;
+    }
+
+    const selectedBooking = pendingBookings[bookingNum];
+    session.tempData.currentBookingDecision = selectedBooking;
+    session.state = 'ACCEPT_REJECT_BOOKING';
+
+    return `
+🔔 *Pending Request*
+
+Passenger: +${selectedBooking.phone.slice(-10)}
+From: ${selectedBooking.from}
+To: ${selectedBooking.to}
+Seats: ${selectedBooking.seats}
+Cost: ₦${selectedBooking.total_cost}
+
+Accept or Reject?
+A) Accept
+B) Reject
+
+_Reply A or B_
+    `.trim();
+  }
+
+  if (state === 'ACCEPT_REJECT_BOOKING') {
+    const choice = input.toLowerCase();
+    const isAccept = choice === 'a' || choice === 'accept' || choice === 'yes';
+    const isReject = choice === 'b' || choice === 'reject' || choice === 'no';
+
+    if (!isAccept && !isReject) {
+      return 'Please reply with A or B.';
+    }
+
+    const booking = session.tempData.currentBookingDecision;
+    const bookingId = booking.id;
+    const passengerPhone = booking.phone;
+
+    if (isAccept) {
+      // Update booking to accepted
+      await db.collection('bookings').doc(bookingId).update({
+        status: 'accepted',
+        accepted_at: new Date()
+      });
+
+      // Notify passenger
+      await sendWhatsAppMessage(`whatsapp:+${passengerPhone}`, `
+✅ *Your Ride is Confirmed!*
+
+Driver has accepted your request!
+
+Booking ID: ${bookingId}
+Driver: ${session.tempData.driver_name}
+Pickup: ${booking.from}
+Dropoff: ${booking.to}
+
+Proceed to payment.
+      `.trim());
+
+      session.state = 'HOME';
+      session.tempData = {};
+
+      return `
+✅ *Booking Accepted!*
+
+Passenger notified. They will proceed to payment.
+
+Type MENU for more options.
+      `.trim();
+    }
+
+    if (isReject) {
+      // Update booking to rejected
+      await db.collection('bookings').doc(bookingId).update({
+        status: 'rejected',
+        rejected_at: new Date()
+      });
+
+      // Notify passenger
+      await sendWhatsAppMessage(`whatsapp:+${passengerPhone}`, `
+❌ *Ride Rejected*
+
+Sorry, the driver couldn't accept your ride.
+
+Booking ID: ${bookingId}
+
+Type MENU to search for another ride.
+      `.trim());
+
+      session.state = 'HOME';
+      session.tempData = {};
+
+      return `
+✅ *Booking Rejected*
+
+Passenger notified. 
+
+Type MENU for more options.
+      `.trim();
+    }
+  }
+
+  // ========== RATE A RIDE FLOW ==========
   if (state === 'RATE_RIDE_LIST') {
-    const rating = parseInt((input || '').trim(), 10);
+    const rating = parseInt(input);
     if (![1, 2, 3, 4, 5].includes(rating)) {
       return 'Please reply with a rating: 1, 2, 3, 4, or 5.';
     }
 
     const bookingId = session.tempData.rateBookingId;
-    const rideId = session.tempData.rateRideId;
     if (!bookingId) {
       session.state = 'MENU_CHOICE';
-      return 'No ride found to rate. Type MENU and try again.';
+      return 'No booking found to rate. Type MENU and try again.';
     }
 
-    const bookingSnap = await db.collection('bookings').doc(bookingId).get();
-    if (!bookingSnap.exists) {
-      session.state = 'MENU_CHOICE';
-      return 'That booking was not found (maybe already rated). Type MENU.';
+    try {
+      await db.collection('bookings').doc(bookingId).update({
+        rider_rating: rating,
+        rated_at: new Date(),
+        status: 'completed'
+      });
+
+      session.state = 'HOME';
+      session.tempData = {};
+
+      return `
+🙏 *Thanks for rating!*
+
+Your rating has been saved.
+
+Type MENU to continue.
+      `.trim();
+    } catch (error) {
+      console.error('Error rating:', error);
+      session.state = 'HOME';
+      session.tempData = {};
+      return 'Error saving rating. Type MENU to continue.';
     }
-
-    await db.collection('bookings').doc(bookingId).update({
-      rider_rating: rating,
-      rated_at: new Date(),
-      status: 'completed'
-    });
-
-    // Update driver rating aggregate (best-effort).
-    const resolvedRideId = rideId || (bookingSnap.data() || {}).ride_id;
-    if (resolvedRideId) {
-      const rideSnap = await db.collection('rides').doc(resolvedRideId).get();
-      const ride = rideSnap.data() || {};
-      const driverPhone = ride.driver_phone;
-
-      if (driverPhone) {
-        const driverSnap = await db.collection('users').doc(driverPhone).get();
-        const driver = driverSnap.data() || {};
-
-        const driver_rating_total = Number(driver.driver_rating_total || 0) + rating;
-        const driver_rating_count = Number(driver.driver_rating_count || 0) + 1;
-        const driver_rating_avg = driver_rating_total / driver_rating_count;
-
-        await db.collection('users').doc(driverPhone).set({
-          phone: driverPhone,
-          role: 'driver',
-          driver_name: ride.driver_name || driver.driver_name,
-          driver_rating_total,
-          driver_rating_count,
-          rating: driver_rating_avg,
-          updated_at: new Date()
-        }, { merge: true });
-      }
-    }
-
-    session.state = 'HOME';
-    return '🙏 Thanks! Your rating has been saved. Type MENU to continue.';
   }
 
+  // Fallback
+  session.state = 'HOME';
+  session.tempData = {};
   return 'Something went wrong. Type MENU to restart.';
 }
 
 // ============================================
-// SEARCH & BOOKING FUNCTIONS
+// HELPER FUNCTIONS
 // ============================================
 
 async function searchRides(from, to, when) {
   try {
-    let query = db.collection('rides').where('status', '==', 'available');
-
-    // In production, use geo-hashing for better location matching
-    // For now, simple string matching
-
-    const snapshot = await query.get();
+    const snapshot = await db.collection('rides').where('status', '==', 'available').get();
     const rides = [];
 
     const fromQ = normalizeText(from);
@@ -682,10 +877,7 @@ async function searchRides(from, to, when) {
       const rideFrom = normalizeText(ride.from);
       const rideTo = normalizeText(ride.to);
 
-      if (
-        rideFrom.includes(fromQ) &&
-        rideTo.includes(toQ)
-      ) {
+      if (rideFrom.includes(fromQ) && rideTo.includes(toQ)) {
         rides.push({
           id: doc.id,
           ...ride
@@ -703,7 +895,6 @@ async function searchRides(from, to, when) {
 function normalizeText(value) {
   return String(value || '')
     .toLowerCase()
-    // Keep only letters/numbers/spaces. This removes emojis and symbols.
     .replace(/[^a-z0-9 ]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -712,12 +903,12 @@ function normalizeText(value) {
 async function createBooking(phone, tempData) {
   const booking = {
     phone,
-    ride_id: tempData.selectedRide.id,
-    seats: tempData.seats,
-    total_cost: tempData.totalCost,
-    status: 'pending',
-    from: tempData.from,
-    to: tempData.to,
+    ride_id: tempData.selectedRide?.id || '',
+    seats: tempData.seats || 1,
+    total_cost: tempData.totalCost || 0,
+    status: 'pending', // Changed from 'pending' - now driver must accept
+    from: tempData.from || '',
+    to: tempData.to || '',
     created_at: new Date()
   };
 
@@ -725,33 +916,96 @@ async function createBooking(phone, tempData) {
   return { id: docRef.id, ...booking };
 }
 
-// ============================================
-// PROFILE & HISTORY FUNCTIONS
-// ============================================
+async function notifyDriverPendingRequest(driver_phone, booking) {
+  const message = `
+🔔 *New Ride Request*
+
+Passenger: +${booking.phone.slice(-10)}
+From: ${booking.from}
+To: ${booking.to}
+Seats: ${booking.seats}
+Total: ₦${booking.total_cost}
+
+Go to Menu → Option 4 to accept or reject!
+  `.trim();
+
+  await sendWhatsAppMessage(`whatsapp:+${driver_phone}`, message).catch(e => console.error('Error notifying driver:', e));
+}
+
+async function showPendingRequests(phone, session) {
+  try {
+    // Get rides offered by this driver
+    const ridesSnapshot = await db.collection('rides')
+      .where('driver_phone', '==', phone)
+      .get();
+
+    const rideIds = ridesSnapshot.docs.map(doc => doc.id);
+
+    if (rideIds.length === 0) {
+      return 'You haven\'t offered any rides yet. Type MENU and choose option 2 to offer a ride!';
+    }
+
+    // Get pending bookings for these rides
+    const bookingsSnapshot = await db.collection('bookings')
+      .where('ride_id', 'in', rideIds)
+      .where('status', '==', 'pending')
+      .get();
+
+    if (bookingsSnapshot.empty) {
+      return 'No pending requests at the moment.';
+    }
+
+    let response = `🔔 *Pending Requests* (${bookingsSnapshot.size})\n\n`;
+    const pendingBookings = [];
+
+    bookingsSnapshot.forEach((doc, i) => {
+      const booking = doc.data();
+      pendingBookings.push({ id: doc.id, ...booking });
+
+      response += `${i + 1}. +${booking.phone.slice(-10)}
+From: ${booking.from}
+Seats: ${booking.seats} | ₦${booking.total_cost}
+\n`;
+    });
+
+    response += `_Reply with number to accept/reject_`;
+
+    session.tempData.pendingBookings = pendingBookings;
+    session.state = 'PENDING_REQUESTS_VIEW';
+
+    return response;
+  } catch (error) {
+    console.error('Error loading pending requests:', error);
+    session.state = 'MENU_CHOICE';
+    return 'Error loading requests. Type MENU to continue.';
+  }
+}
 
 async function showMyBookings(phone) {
   try {
     const snapshot = await db.collection('bookings')
       .where('phone', '==', phone)
+      .orderBy('created_at', 'desc')
       .limit(5)
       .get();
 
     if (snapshot.empty) {
-      return 'No bookings yet. Type MENU to find a ride!';
+      return '📋 No bookings yet. Type MENU and choose option 1 to find a ride!';
     }
 
     let response = '📋 *Your Recent Bookings*\n\n';
 
     snapshot.forEach((doc, i) => {
       const booking = doc.data();
-      response += `${i + 1}. ${booking.from} → ${booking.to}
-${booking.status.toUpperCase()} | ₦${booking.total_cost}
-\n`;
+      response += `${i + 1}. ${booking.from} → ${booking.to}\n`;
+      response += `Status: ${booking.status.toUpperCase()} | ₦${booking.total_cost}\n\n`;
     });
 
+    response += 'Type MENU to go back.';
     return response;
   } catch (error) {
-    return 'Error loading bookings.';
+    console.error('Error loading bookings:', error);
+    return 'Error loading bookings. Type MENU to continue.';
   }
 }
 
@@ -764,18 +1018,23 @@ async function showProfile(phone) {
       .where('phone', '==', phone)
       .get();
 
-    return `
-👤 *Your Profile*
+    let profile = `👤 *Your Profile*\n\n`;
+    profile += `📞 Phone: ${phone}\n`;
+    profile += `🎫 Rides Booked: ${bookingsSnapshot.size}\n`;
+    profile += `⭐ Rating: ${user.rating ? user.rating.toFixed(1) : 'N/A'}\n`;
 
-📞 Phone: ${phone}
-🎫 Rides Booked: ${bookingsSnapshot.size}
-⭐ Rating: ${user.rating || 'N/A'}
-📅 Member since: ${user.created_at ? new Date(user.created_at).toLocaleDateString() : 'New'}
+    if (user.role === 'driver') {
+      profile += `🚗 Driver Name: ${user.driver_name || 'N/A'}\n`;
+      profile += `🚙 Rides Offered: ${user.rides_offered || 0}\n`;
+    }
 
-Type MENU to go back.
-    `.trim();
+    profile += `📅 Member since: ${user.created_at ? new Date(user.created_at).toLocaleDateString() : 'New'}\n\n`;
+    profile += 'Type MENU to go back.';
+
+    return profile;
   } catch (error) {
-    return 'Error loading profile.';
+    console.error('Error loading profile:', error);
+    return 'Error loading profile. Type MENU to continue.';
   }
 }
 
@@ -784,20 +1043,20 @@ async function showRidesToRate(phone, session) {
     const snapshot = await db.collection('bookings')
       .where('phone', '==', phone)
       .where('status', '==', 'confirmed')
+      .orderBy('created_at', 'desc')
       .limit(1)
       .get();
 
     if (snapshot.empty) {
       session.state = 'MENU_CHOICE';
-      return 'No confirmed rides to rate yet.';
+      return '⭐ No confirmed rides to rate yet. Type MENU to continue.';
     }
 
-    // For simplicity, show first ride
     const bookingSnap = snapshot.docs[0];
     const booking = bookingSnap.data();
 
     session.tempData.rateBookingId = bookingSnap.id;
-    session.tempData.rateRideId = booking.ride_id;
+    session.state = 'RATE_RIDE_LIST';
 
     return `
 ⭐ *Rate Your Ride*
@@ -815,7 +1074,9 @@ How would you rate it?
 _Reply 1-5_
     `.trim();
   } catch (error) {
-    return 'Error loading rides to rate.';
+    console.error('Error loading rides to rate:', error);
+    session.state = 'MENU_CHOICE';
+    return 'Error loading rides. Type MENU to continue.';
   }
 }
 
@@ -823,24 +1084,21 @@ function showHelp() {
   return `
 ❓ *Help & Support*
 
-*Common Questions:*
+*Student:*
+1️⃣ Find a ride → Menu → Option 1
+2️⃣ Book and pay → Follow prompts
+3️⃣ Driver accepts/rejects → Wait for notification
 
-1️⃣ How to find a ride?
-   Menu → Option 1
+*Driver:*
+1️⃣ Offer a ride → Menu → Option 2
+2️⃣ Check requests → Menu → Option 4
+3️⃣ Accept/Reject → Respond to pending requests
 
-2️⃣ How to pay?
-   Bank transfer or USSD code provided after booking
+*Payment:*
+- Bank transfer or USSD after booking
 
-3️⃣ What if driver cancels?
-   We'll refund you within 2 hours
-
-4️⃣ Is my payment safe?
-   Yes! We partner with verified payment providers
-
-5️⃣ Report a problem?
-   Reply with "support"
-
-📞 WhatsApp Support: Available 8AM - 8PM
+*Support:*
+📞 Available 8AM - 8PM
 
 Type MENU to go back.
   `.trim();
@@ -878,7 +1136,6 @@ app.post('/api/admin/add-ride', express.json(), async (req, res) => {
       from,
       to,
       departure_time,
-      total_seats: seats,
       seats_available: seats,
       cost_per_seat,
       driver_phone,
@@ -890,6 +1147,7 @@ app.post('/api/admin/add-ride', express.json(), async (req, res) => {
     const docRef = await db.collection('rides').add(ride);
     res.json({ success: true, ride_id: docRef.id });
   } catch (error) {
+    console.error('Admin endpoint error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -901,8 +1159,8 @@ app.get('/api/admin/stats', async (req, res) => {
     const usersSnapshot = await db.collection('users').get();
 
     const totalRevenue = bookingsSnapshot.docs
-      .filter(d => ['confirmed', 'completed'].includes(d.data().status))
-      .reduce((sum, d) => sum + d.data().total_cost, 0);
+      .filter(d => ['confirmed', 'completed'].includes((d.data().status || '').toLowerCase()))
+      .reduce((sum, d) => sum + (Number(d.data().total_cost) || 0), 0);
 
     res.json({
       total_rides: ridesSnapshot.size,
@@ -911,6 +1169,7 @@ app.get('/api/admin/stats', async (req, res) => {
       total_revenue: totalRevenue
     });
   } catch (error) {
+    console.error('Stats endpoint error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -931,6 +1190,8 @@ app.listen(PORT, () => {
 ➕ Add ride: POST /api/admin/add-ride
 
 🌍 Expose with: ngrok http 3000
+
+✨ NEW: Drivers can accept/reject bookings!
   `);
 });
 
