@@ -8,6 +8,8 @@
 const express = require('express');
 const twilio = require('twilio');
 const admin = require('firebase-admin');
+const { processPayment } = require('./utils/paymentHandler');
+const { getBotWallet, getBalance } = require('./stellarClient');
 require('dotenv').config();
 
 const app = express();
@@ -17,7 +19,7 @@ app.use(express.json());
 // Firebase setup
 const serviceAccount = require('./serviceAccountKey.json');
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
+   credential: admin.credential.cert(serviceAccount)
 });
 const db = admin.firestore();
 
@@ -415,10 +417,12 @@ Type MENU to find another ride.
       const rideId = session.tempData.selectedRide?.id;
       const seatsBooked = Number(session.tempData.seats || 0);
 
-      await db.collection('bookings').doc(bookingId).update({
-        status: 'confirmed',
-        paid_at: new Date()
-      });
+          await db.collection('bookings').doc(booking.id).update({
+            status: 'confirmed',
+            paid_at: new Date(),
+            txHash: paymentResult.txHash,
+            explorerUrl: paymentResult.explorerUrl
+          });
 
       // Notify driver that payment is done
       const driver_phone = session.tempData.selectedRide.driver_phone;
@@ -467,7 +471,6 @@ At: ${session.tempData.selectedRide?.from}
 Time: ${session.tempData.selectedRide?.departure_time}
 
 👋 Have a great ride!
-
 Type MENU for more options.
       `.trim();
     }
