@@ -1,3 +1,12 @@
-.env
 node_modules/
+
+# Environment variables (secrets)
+.env
+.env.*
+
+# Firebase service account keys — never commit
 serviceAccountKey.json
+*-firebase-adminsdk-*.json
+
+
+
