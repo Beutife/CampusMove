@@ -1,1210 +1,1314 @@
 /**
- * CampusMove WhatsApp Bot - WITH DRIVER ACCEPT/REJECT
- * ✅ Drivers can accept or reject ride requests
- * ✅ Passengers get notifications
- * ✅ Full booking flow
+ * CampusMove WhatsApp Bot — FIXED VERSION
+ *
+ * Changes from original:
+ * ✅ sendMsg() now uses Baileys (not broken Twilio)
+ * ✅ Removed unused /whatsapp POST endpoint (Twilio webhook)
+ * ✅ Removed Twilio imports & references
+ * ✅ Consistent messaging: Baileys in + Baileys out
  */
 
+const fs   = require('fs');
+const path = require('path');
 const express = require('express');
-const twilio = require('twilio');
-const admin = require('firebase-admin');
-const { processPayment } = require('../utils/paymentHandler');
-const { getBotWallet, getBalance } = require('../stellarClient');
-require('dotenv').config();
+const admin   = require('firebase-admin');
+const {
+  makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  Browsers,
+} = require('@whiskeysockets/baileys');
+const pino = require('pino');
+const qrcode = require('qrcode-terminal');
 
-const app = express();
-app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
+const { buildPaymentMessage, verifyWebhookSignature } = require('../utils/paymentHandler');
+const { storeReceipt } = require('../utils/verificationService');
 
-// Firebase setup
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      // This .replace fix is vital for Vercel to read the key correctly
-      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-    }),
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+
+// ─────────────────────────────────────────────
+// FIREBASE INIT
+// ─────────────────────────────────────────────
+function normalizePrivateKey(key) {
+  if (!key) return key;
+  if (key.includes('-----BEGIN PRIVATE KEY-----\n')) return key;
+  return key.replace(/\\n/g, '\n');
+}
+
+function getFirebaseCredential() {
+  const p = path.join(__dirname, '..', 'serviceAccountKey.json');
+  if (fs.existsSync(p)) {
+    const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (data && data.project_id) return admin.credential.cert(data);
+  }
+  const { FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY } = process.env;
+  if (!FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) {
+    throw new Error('Missing Firebase credentials.');
+  }
+  return admin.credential.cert({
+    projectId:   FIREBASE_PROJECT_ID,
+    clientEmail: FIREBASE_CLIENT_EMAIL,
+    privateKey:  normalizePrivateKey(FIREBASE_PRIVATE_KEY),
   });
 }
 
+if (!admin.apps.length) {
+  admin.initializeApp({ credential: getFirebaseCredential() });
+}
 const db = admin.firestore();
 
-// Twilio setup
-const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const authToken = process.env.TWILIO_AUTH_TOKEN;
-const twilioWhatsAppNumber = process.env.TWILIO_WHATSAPP_NUMBER;
-const client = twilio(accountSid, authToken);
+// ─────────────────────────────────────────────
+// EXPRESS SETUP
+// ─────────────────────────────────────────────
+const app = express();
+app.use(express.urlencoded({ extended: false }));
 
-// ============================================
-// SESSION MANAGEMENT
-// ============================================
-const userSessions = {};
+// Paystack raw body BEFORE json middleware
+app.post('/api/paystack/webhook',
+  express.raw({ type: 'application/json' }),
+  handlePaystackWebhook
+);
 
-async function initSession(phone) {
-  if (!userSessions[phone]) {
-    const userDoc = await db.collection('users').doc(phone).get();
-    userSessions[phone] = {
-      phone,
-      state: 'HOME',
-      data: userDoc.exists ? userDoc.data() : null,
-      tempData: {}
-    };
-  }
-  return userSessions[phone];
+app.use(express.json());
+
+app.get('/', (_req, res) => res.json({
+  status: 'ok',
+  service: 'CampusMove Bot',
+  version: '2.0.0',
+}));
+
+// ─────────────────────────────────────────────
+// BAILEYS SETUP
+// ─────────────────────────────────────────────
+let sock; // global WhatsApp socket — set when startWhatsApp() connects
+
+async function startWhatsApp() {
+  const authDir = path.join(__dirname, '..', '.wa_auth');
+  fs.mkdirSync(authDir, { recursive: true });
+ 
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+ 
+  // Fetch the latest WA version — required for Baileys v7+
+  const { version } = await fetchLatestBaileysVersion();
+ 
+  console.log(`📱 Baileys starting with WA v${version.join('.')}`);
+ 
+  sock = makeWASocket({
+    version,
+    auth:  state,
+    // Do NOT use printQRInTerminal — we render it ourselves below for reliability
+    printQRInTerminal: false,
+    logger: pino({ level: 'silent' }),
+    // Use Baileys v7 standard browser fingerprint — fixes 405 Connection Failure
+    browser: Browsers.appropriate('Chrome'),
+    // Prevent premature disconnects
+    connectTimeoutMs:    60_000,
+    keepAliveIntervalMs: 25_000,
+    retryRequestDelayMs: 2_000,
+    maxMsgRetryCount: 5,
+  });
+ 
+  sock.ev.on('creds.update', saveCreds);
+ 
+  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+    // QR code received — render it ourselves using qrcode-terminal
+    if (qr) {
+      console.log('\n📱 ══════════════════════════════════════════════');
+      console.log('    SCAN THIS QR CODE IN WHATSAPP NOW');
+      console.log('    WhatsApp → Settings → Linked Devices');
+      console.log('    → Link a Device → scan the code below');
+      console.log('════════════════════════════════════════════════\n');
+      qrcode.generate(qr, { small: true });
+      console.log('\n════════════════════════════════════════════════');
+      console.log('    ☝️  Scan the QR above within 60 seconds');
+      console.log('════════════════════════════════════════════════\n');
+    }
+ 
+    if (connection === 'open') {
+      console.log('\n✅ ══════════════════════════════════');
+      console.log('   WHATSAPP CONNECTED!');
+      console.log('   CampusMove bot is LIVE 🚗');
+      console.log('══════════════════════════════════\n');
+    }
+ 
+    if (connection === 'close') {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const reason     = lastDisconnect?.error?.message || 'unknown';
+ 
+      console.log(`❌ WA closed — code: ${statusCode}, reason: ${reason}`);
+ 
+      if (statusCode === DisconnectReason.loggedOut) {
+        console.log('🔴 LOGGED OUT. Delete .wa_auth folder and restart to re-scan QR.');
+        return; // don't reconnect
+      }
+ 
+      if (statusCode === 515 || statusCode === 405) {
+        // Stream/connection error — clear bad auth and restart fresh
+        console.log(`⚠️  Error ${statusCode} — clearing auth and restarting in 8s...`);
+        try {
+          fs.rmSync(authDir, { recursive: true, force: true });
+          fs.mkdirSync(authDir, { recursive: true });
+        } catch (e) {}
+        setTimeout(startWhatsApp, 8000);
+        return;
+      }
+
+      // Any other disconnect — reconnect after delay
+      const delay = statusCode === 408 ? 10000 : 5000;
+      console.log(`🔄 Reconnecting in ${delay/1000}s...`);
+      setTimeout(startWhatsApp, delay);
+    }
+  });
+ 
+  // ── INCOMING MESSAGE LISTENER ──────────────────
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+
+    for (const msg of messages) {
+      if (msg.key.fromMe) continue;   // ignore messages the bot sent
+      if (!msg.message)   continue;
+
+      const jid = msg.key.remoteJid;
+      if (!jid || jid.endsWith('@g.us')) continue; // skip group chats
+
+      const phone = jid.split('@')[0]; // bare number, no + prefix
+      const body  = (
+        msg.message?.conversation ||
+        msg.message?.extendedTextMessage?.text ||
+        msg.message?.imageMessage?.caption ||
+        ''
+      ).trim();
+
+      if (!body) continue;
+      console.log(`📨 [${phone}]: ${body}`);
+
+      try {
+        await handleIncoming(phone, body);
+      } catch (err) {
+        console.error('❌ Message error:', err);
+        await sendMsg(phone, '❌ Something went wrong.\n\nType *MENU* to restart.').catch(() => {});
+      }
+    }
+  });
 }
 
-// ============================================
-// MAIN MESSAGE HANDLER
-// ============================================
-app.post('/whatsapp', async (req, res) => {
-  const incoming_msg = req.body.Body?.trim();
-  const from = req.body.From;
-  const student_phone = from.split(':')[1];
+// ─────────────────────────────────────────────
+// PHONE HELPERS
+// ─────────────────────────────────────────────
+function stripPlus(phone = '') {
+  return String(phone).replace(/^\+/, '').replace(/^whatsapp:\+?/, '');
+}
 
-  console.log(`📨 From ${student_phone}: ${incoming_msg}`);
+// ─────────────────────────────────────────────
+// APPROVED DRIVER WHITELIST
+// ─────────────────────────────────────────────
+function getApprovedDrivers() {
+  const raw = process.env.APPROVED_DRIVER_PHONES || '';
+  return raw.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+function isApprovedDriver(phone) {
+  const list = getApprovedDrivers();
+  if (list.length === 0) return true;
+  return list.includes(stripPlus(phone));
+}
+
+function isAdmin(phone) {
+  const list = (process.env.ADMIN_PHONES || '').split(',').map(s => s.trim()).filter(Boolean);
+  return list.includes(stripPlus(phone));
+}
+
+// ─────────────────────────────────────────────
+// FIRESTORE SESSION LAYER
+// ─────────────────────────────────────────────
+async function getSession(phone) {
+  const clean = stripPlus(phone);
+  const doc = await db.collection('sessions').doc(clean).get();
+  if (doc.exists) return doc.data();
+  return { phone: clean, state: 'HOME', tempData: {} };
+}
+
+async function saveSession(phone, session) {
+  const clean = stripPlus(phone);
+  session.phone = clean;
+  session.updatedAt = Date.now();
+  await db.collection('sessions').doc(clean).set(session);
+}
+
+async function clearSession(phone) {
+  const clean = stripPlus(phone);
+  await db.collection('sessions').doc(clean).set({
+    phone: clean,
+    state: 'HOME',
+    tempData: {},
+    updatedAt: Date.now(),
+  });
+}
+
+// ─────────────────────────────────────────────
+// MESSAGING UTILITY — BAILEYS ONLY (FIXED)
+// ─────────────────────────────────────────────
+/**
+ * Send WhatsApp message via Baileys socket
+ * @param {string} phone - Phone number (with or without +)
+ * @param {string} body - Message text
+ * @returns {Promise<string>} JID of message
+ */
+async function sendMsg(phone, body) {
+  const clean = stripPlus(phone);
+  const jid = `${clean}@s.whatsapp.net`;
 
   try {
-    if (!incoming_msg) {
-      return res.sendStatus(200);
+    // Guard: ensure sock is connected
+    if (!sock || sock.ws?.readyState !== 1) {
+      console.error(`❌ sendMsg: WhatsApp socket not connected`);
+      throw new Error('WhatsApp socket disconnected');
     }
 
-    const session = await initSession(student_phone);
+    // Send message via Baileys
+    await sock.sendMessage(jid, { text: body });
+    console.log(`✅ Sent to ${phone}`);
+    return jid;
 
-    // Handle universal commands
-    if (incoming_msg.toLowerCase() === 'menu') {
-      session.state = 'HOME';
-      session.tempData = {};
-    }
-
-    // Route to handler
-    let response = '';
-
-    if (session.state === 'HOME') {
-      response = showMainMenu();
-      session.state = 'MENU_CHOICE';
-    } else if (session.state === 'MENU_CHOICE') {
-      response = await handleMenuChoice(student_phone, incoming_msg, session);
-    } else {
-      response = await handleState(student_phone, incoming_msg, session);
-    }
-
-    if (response) {
-      await sendWhatsAppMessage(from, response);
-    }
-
-    res.sendStatus(200);
-  } catch (error) {
-    console.error('❌ Error:', error);
-    await sendWhatsAppMessage(from, '❌ Oops! Something went wrong.\n\nType MENU to restart.').catch(e => console.error('Error sending error message:', e));
-    res.sendStatus(500);
+  } catch (err) {
+    console.error(`❌ Failed to send to ${phone}:`, err.message);
+    throw err;
   }
-});
+}
 
-// ============================================
-// MENU HANDLERS
-// ============================================
+// ─────────────────────────────────────────────
+// MAIN MESSAGE HANDLER
+// ─────────────────────────────────────────────
+async function handleIncoming(phone, input) {
+  try {
+    // ── Admin override ──────────────────────────
+    if (isAdmin(phone) && input.startsWith('ADMIN:')) {
+      await handleAdminCommand(phone, input.slice(6).trim());
+      return;
+    }
 
+    // ── Universal driver commands ───────────────
+    const upper = input.toUpperCase();
+
+    if (upper.startsWith('CLOSE ')) {
+      await handleDriverClose(phone, input.slice(6).trim());
+      return;
+    }
+    if (upper.startsWith('CANCEL_BOOKING ')) {
+      await handleDriverCancelBooking(phone, input.slice(15).trim());
+      return;
+    }
+
+    // ── State machine ───────────────────────────
+    const session = await getSession(phone);
+
+    if (upper === 'MENU' || upper === 'HI' || upper === 'START' || upper === 'HELLO') {
+      await clearSession(phone);
+      await sendMsg(phone, showMainMenu());
+      const s = await getSession(phone);
+      s.state = 'MENU_CHOICE';
+      await saveSession(phone, s);
+      return;
+    }
+
+    let reply = '';
+
+    if (session.state === 'HOME' || session.state === 'MENU_CHOICE') {
+      reply = await handleMenuChoice(phone, input, session);
+    } else {
+      reply = await handleState(phone, input, session);
+    }
+
+    if (reply) await sendMsg(phone, reply).catch(err => {
+      console.error(`Failed to send reply to ${phone}:`, err.message);
+    });
+
+  } catch (err) {
+    console.error('❌ Handler error:', err);
+    await sendMsg(phone, '❌ Something went wrong.\n\nType *MENU* to restart.').catch(() => {});
+  }
+}
+
+// ─────────────────────────────────────────────
+// ADMIN COMMANDS
+// ─────────────────────────────────────────────
+async function handleAdminCommand(adminPhone, cmd) {
+  const parts = cmd.split(' ');
+  const action = (parts[0] || '').toUpperCase();
+
+  if (action === 'MSG' && parts.length >= 3) {
+    const target = parts[1];
+    const text   = parts.slice(2).join(' ');
+    await sendMsg(target, `[CampusMove Admin]\n${text}`).catch(() => {});
+    await sendMsg(adminPhone, `✅ Message sent to ${target}`).catch(() => {});
+
+  } else if (action === 'STATUS' && parts[1]) {
+    const snap = await db.collection('bookings').doc(parts[1]).get();
+    if (!snap.exists) {
+      await sendMsg(adminPhone, 'Booking not found.').catch(() => {});
+      return;
+    }
+    const b = snap.data();
+    await sendMsg(adminPhone, `📋 Booking ${parts[1]}\nStatus: ${b.status}\nPhone: ${b.phone}\nRoute: ${b.from} → ${b.to}\nCost: ₦${b.total_cost}`).catch(() => {});
+
+  } else if (action === 'RESET' && parts[1]) {
+    await clearSession(parts[1]);
+    await sendMsg(adminPhone, `✅ Session reset for ${parts[1]}`).catch(() => {});
+
+  } else if (action === 'REFUND' && parts[1]) {
+    await db.collection('bookings').doc(parts[1]).update({ status: 'refunded', refunded_at: Date.now() });
+    const snap = await db.collection('bookings').doc(parts[1]).get();
+    const phone = snap.data()?.phone;
+    if (phone) await sendMsg(phone, `✅ Your booking ${parts[1]} has been refunded.\n\nType MENU to book another ride.`).catch(() => {});
+    await sendMsg(adminPhone, `✅ Refund issued for ${parts[1]}`).catch(() => {});
+
+  } else {
+    await sendMsg(adminPhone, `Admin commands:\nADMIN: MSG <phone> <text>\nADMIN: STATUS <bookingId>\nADMIN: RESET <phone>\nADMIN: REFUND <bookingId>`).catch(() => {});
+  }
+}
+
+// ─────────────────────────────────────────────
+// MAIN MENU
+// ─────────────────────────────────────────────
 function showMainMenu() {
-  return `
-👋 Welcome to *CampusMove*!
+  return `👋 Welcome to *CampusMove!* 🚗
 
-Find rides, book transport, go anywhere on campus.
+Your campus transport, sorted.
 
-1️⃣ 🔍 Find a ride
-2️⃣ 🚗 Offer a ride (driver)
-3️⃣ 📋 My bookings
-4️⃣ 🔔 Pending requests (driver)
-5️⃣ ⭐ Rate a ride
-6️⃣ 👤 My profile
-7️⃣ ❓ Help
+1️⃣  Find a ride
+2️⃣  Offer a ride (drivers)
+3️⃣  My bookings
+4️⃣  Pending requests (drivers)
+5️⃣  Rate a ride
+6️⃣  My profile
+7️⃣  Help
 
-_Reply with 1-7_
-  `.trim();
+_Reply with 1–7_`.trim();
 }
 
 async function handleMenuChoice(phone, choice, session) {
-  choice = String(choice).trim().toLowerCase();
+  const c = choice.trim();
 
-  if (choice === '1') {
-    session.tempData = {};
+  if (c === '1') {
     session.state = 'FIND_RIDE_FROM';
-    return `
-📍 *Find a Ride*
-
-Where are you leaving from?
-
-Send location or type:
-🏠 Oduduwa
-🚪 Main gate
-🏬 Campus center
-🏘️ Other (type the area)
-    `.trim();
+    session.tempData = {};
+    await saveSession(phone, session);
+    return `📍 *Find a Ride*\n\nWhere are you leaving from?\n\nType your pickup location\n_(e.g. Main Gate, Oduduwa Hall, Fajuyi Hall)_`;
   }
 
-  if (choice === '2') {
+  if (c === '2') {
+    if (!isApprovedDriver(phone)) {
+      return `🚗 *Driver Registration*\n\nYour number is not yet approved as a driver.\n\nContact Campus Move to get verified:\n📞 ${process.env.SUPPORT_PHONE || 'our support line'}\n\nType MENU to go back.`;
+    }
     session.tempData = {};
     session.state = 'OFFER_RIDE_CHECK';
-    return `
-🚗 *Offer a Ride*
-
-Are you a registered driver?
-
-A) Yes, I'm registered
-B) No, first time
-
-_Reply A or B_
-    `.trim();
+    await saveSession(phone, session);
+    return `🚗 *Offer a Ride*\n\nAre you already registered?\n\nA) Yes — take me straight to posting a ride\nB) No — register me first\n\n_Reply A or B_`;
   }
 
-  if (choice === '3') {
+  if (c === '3') {
     session.state = 'MENU_CHOICE';
+    await saveSession(phone, session);
     return await showMyBookings(phone);
   }
 
-  if (choice === '4') {
-    session.state = 'MENU_CHOICE';
+  if (c === '4') {
     return await showPendingRequests(phone, session);
   }
 
-  if (choice === '5') {
+  if (c === '5') {
     return await showRidesToRate(phone, session);
   }
 
-  if (choice === '6') {
+  if (c === '6') {
     session.state = 'MENU_CHOICE';
+    await saveSession(phone, session);
     return await showProfile(phone);
   }
 
-  if (choice === '7') {
+  if (c === '7') {
     session.state = 'MENU_CHOICE';
+    await saveSession(phone, session);
     return showHelp();
   }
 
-  return 'Invalid choice. Please reply with 1-7.';
+  return `Please reply with a number 1–7.\n\n${showMainMenu()}`;
 }
 
-// ============================================
-// FIND RIDE FLOW (STUDENT)
-// ============================================
-
+// ─────────────────────────────────────────────
+// STATE MACHINE — FIND RIDE FLOW
+// ─────────────────────────────────────────────
 async function handleState(phone, input, session) {
   const state = session.state;
-  input = String(input).trim();
+  const inp   = input.trim();
 
-  // ========== FIND RIDE FLOW ==========
   if (state === 'FIND_RIDE_FROM') {
-    session.tempData.from = input;
+    session.tempData.from = inp;
     session.state = 'FIND_RIDE_TO';
-    return `
-✅ From: *${input}*
-
-📍 Where are you going to?
-
-Send destination or type:
-🏠 Oduduwa
-🚪 Main gate
-🏬 Market
-🎓 Faculty area
-🌆 Other (type area)
-    `.trim();
+    await saveSession(phone, session);
+    return `✅ From: *${inp}*\n\n📍 Where are you going?\n_(e.g. Fajuyi Hall, Moremi Hall, OAU Teaching Hospital)_`;
   }
 
   if (state === 'FIND_RIDE_TO') {
-    session.tempData.to = input;
+    session.tempData.to = inp;
     session.state = 'FIND_RIDE_WHEN';
-    return `
-✅ To: *${input}*
-
-⏰ When do you want to leave?
-
-1️⃣ Now (immediately)
-2️⃣ Today (later)
-3️⃣ Tomorrow
-4️⃣ This week
-
-_Reply 1-4_
-    `.trim();
+    await saveSession(phone, session);
+    return `✅ To: *${inp}*\n\n⏰ When do you want to leave?\n\n1️⃣ Now\n2️⃣ Today (later)\n3️⃣ Tomorrow\n4️⃣ This week\n\n_Reply 1–4_`;
   }
 
   if (state === 'FIND_RIDE_WHEN') {
-    const timeMap = {
-      '1': 'now', 'now': 'now', 'immediately': 'now',
-      '2': 'today', 'today': 'today', 'later': 'today',
-      '3': 'tomorrow', 'tomorrow': 'tomorrow',
-      '4': 'thisweek', 'this week': 'thisweek', 'thisweek': 'thisweek'
-    };
-
-    const when = timeMap[input.toLowerCase()] || 'today';
+    const timeMap = { '1':'now','now':'now','2':'today','today':'today','3':'tomorrow','tomorrow':'tomorrow','4':'thisweek','this week':'thisweek' };
+    const when = timeMap[inp.toLowerCase()] || 'today';
     session.tempData.when = when;
 
-    // Search for rides
     const rides = await searchRides(session.tempData.from, session.tempData.to, when);
 
     if (rides.length === 0) {
       session.state = 'HOME';
-      session.tempData = {};
-      return `
-😔 *No rides found* for:
-${session.tempData.from} → ${session.tempData.to}
-
-Type MENU to search again or try a different location.
-      `.trim();
+      await saveSession(phone, session);
+      return `😔 *No rides found*\n\n${session.tempData.from} → ${session.tempData.to}\n\nTry a different location or time.\nType MENU to search again.`;
     }
 
-    // Show rides
-    let response = `🚗 *Available Rides*\n\n`;
-    rides.forEach((ride, i) => {
-      response += `${i + 1}. ${ride.driver_name}
-💰 ₦${ride.cost_per_seat} | 🪑 ${ride.seats_available} seats
-⏰ ${ride.departure_time}
-\n`;
+    let msg = `🚗 *Available Rides* (${rides.length} found)\n\n`;
+    rides.forEach((r, i) => {
+      msg += `*${i+1}. ${r.provider_name || r.driver_name}*\n`;
+      msg += `   🚐 ${r.vehicle_type || 'Car'}  |  🪑 ${r.seats_available} seats\n`;
+      msg += `   💰 ₦${r.cost_per_seat}/seat  |  ⏰ ${r.departure_time}\n`;
+      msg += `   ${r.from} → ${r.to}\n\n`;
     });
-
-    response += `_Reply with number to book_`;
+    msg += `_Reply with number to book_`;
 
     session.tempData.searchResults = rides;
     session.state = 'FIND_RIDE_SELECT';
-    return response;
+    await saveSession(phone, session);
+    return msg;
   }
 
   if (state === 'FIND_RIDE_SELECT') {
-    const rideNum = parseInt(input) - 1;
+    const idx = parseInt(inp) - 1;
     const rides = session.tempData.searchResults || [];
-
-    if (isNaN(rideNum) || rideNum < 0 || rideNum >= rides.length) {
-      return `Invalid choice. Reply 1-${rides.length}`;
+    if (isNaN(idx) || idx < 0 || idx >= rides.length) {
+      return `Please reply 1–${rides.length}`;
     }
-
-    const selectedRide = rides[rideNum];
-    session.tempData.selectedRide = selectedRide;
+    session.tempData.selectedRide = rides[idx];
     session.state = 'BOOK_RIDE_SEATS';
-
-    return `
-✅ Selected: *${selectedRide.driver_name}*
-${selectedRide.from} → ${selectedRide.to}
-⏰ ${selectedRide.departure_time}
-💰 ₦${selectedRide.cost_per_seat}/seat
-
-🪑 How many seats do you need?
-
-_Reply: 1, 2, 3, etc._
-    `.trim();
+    await saveSession(phone, session);
+    const r = rides[idx];
+    return `✅ *${r.provider_name || r.driver_name}*\n${r.from} → ${r.to}\n⏰ ${r.departure_time}\n💰 ₦${r.cost_per_seat}/seat\n\n🪑 How many seats do you need?\n_(Reply: 1, 2, 3…)_`;
   }
 
   if (state === 'BOOK_RIDE_SEATS') {
-    const seats = parseInt(input);
-
-    if (isNaN(seats) || seats < 1) {
-      return 'Please reply with a valid number (1, 2, 3, etc.)';
-    }
-
+    const seats = parseInt(inp);
+    if (isNaN(seats) || seats < 1) return 'Please reply with a valid number (1, 2, 3…)';
     const ride = session.tempData.selectedRide;
-
-    if (seats > (ride.seats_available || 0)) {
-      return `❌ Only ${ride.seats_available} seats left. Try again.`;
-    }
-
-    session.tempData.seats = seats;
+    if (seats > (ride.seats_available || 0)) return `❌ Only ${ride.seats_available} seat(s) available.`;
+    session.tempData.seats     = seats;
     session.tempData.totalCost = ride.cost_per_seat * seats;
     session.state = 'CONFIRM_BOOKING';
-
-    return `
-📊 *Booking Summary*
-
-From: ${ride.from}
-To: ${ride.to}
-Driver: ${ride.driver_name}
-Seats: ${seats}
-Total: ₦${session.tempData.totalCost}
-
-Confirm? 
-A) Yes, book it
-B) Cancel
-
-_Reply A or B_
-    `.trim();
+    await saveSession(phone, session);
+    return `📊 *Booking Summary*\n\nFrom: ${ride.from}\nTo: ${ride.to}\nProvider: ${ride.provider_name || ride.driver_name}\nSeats: ${seats}\nTotal: ₦${session.tempData.totalCost}\n\nConfirm?\nA) Yes, book it\nB) Cancel\n\n_Reply A or B_`;
   }
 
   if (state === 'CONFIRM_BOOKING') {
-    const isYes = input.toLowerCase() === 'a' || input.toLowerCase() === 'yes';
-    const isNo = input.toLowerCase() === 'b' || input.toLowerCase() === 'no' || input.toLowerCase() === 'cancel';
+    const yes = ['a','yes'].includes(inp.toLowerCase());
+    const no  = ['b','no','cancel'].includes(inp.toLowerCase());
+    if (!yes && !no) return 'Please reply A or B.';
+    if (no) { await clearSession(phone); return 'Booking cancelled.\n\nType MENU to start over.'; }
 
-    if (!isYes && !isNo) {
-      return 'Please reply with A or B.';
-    }
-
-    if (isNo) {
-      session.state = 'HOME';
-      session.tempData = {};
-      return 'Booking cancelled.\n\nType MENU to start over.';
-    }
-
-    // Create booking in PENDING state
     const booking = await createBooking(phone, session.tempData);
     session.state = 'WAITING_DRIVER_ACCEPT';
     session.tempData.bookingId = booking.id;
+    session.tempData.requestedAt = Date.now();
+    await saveSession(phone, session);
 
-    // Notify driver about the pending request
-    const driver_phone = session.tempData.selectedRide.driver_phone;
-    await notifyDriverPendingRequest(driver_phone, booking);
+    const driverPhone = session.tempData.selectedRide.driver_phone;
+    await notifyDriver(driverPhone, booking, session.tempData.selectedRide);
 
-    return `
-⏳ *Waiting for Driver Confirmation*
+    scheduleBookingTimeout(booking.id, phone, driverPhone);
 
-Booking ID: ${booking.id}
-
-We've sent a request to ${session.tempData.selectedRide.driver_name}!
-
-The driver will accept or reject your request.
-We'll notify you when they respond.
-
-⏱️ This usually takes less than 1 minute.
-
-Type MENU if you want to search for other rides.
-      `.trim();
+    return `⏳ *Request Sent!*\n\nBooking ID: \`${booking.id}\`\n\nWaiting for *${session.tempData.selectedRide.provider_name || session.tempData.selectedRide.driver_name}* to confirm.\n\n⏱️ They have 5 minutes to accept.\nWe'll notify you immediately.\n\nType MENU to cancel and search for another ride.`;
   }
 
   if (state === 'WAITING_DRIVER_ACCEPT') {
-    // Check if booking was accepted
     const bookingId = session.tempData.bookingId;
-    try {
-      const bookingSnap = await db.collection('bookings').doc(bookingId).get();
-      const booking = bookingSnap.data();
+    const snap = await db.collection('bookings').doc(bookingId).get();
+    if (!snap.exists) { await clearSession(phone); return 'Booking not found. Type MENU to start over.'; }
+    const bk = snap.data();
 
-      if (booking.status === 'accepted') {
-        session.state = 'SHOW_PAYMENT';
-        return `
-✅ *Driver Accepted Your Request!*
-
-Booking ID: ${booking.id}
-
-Driver: ${session.tempData.selectedRide.driver_name}
-Pickup: ${booking.from}
-Dropoff: ${booking.to}
-Time: ${session.tempData.selectedRide.departure_time}
-
-💰 *Payment Required: ₦${session.tempData.totalCost}*
-
-*Option 1: Bank Transfer*
-Account: OAU Student Transport
-Bank: First Bank
-Amount: ₦${session.tempData.totalCost}
-Reference: ${booking.id}
-
-*Option 2: USSD*
-Dial: *901*20*${booking.id}*1#
-
-Reply "paid" when done!
-        `.trim();
-      }
-
-      if (booking.status === 'rejected') {
-        session.state = 'HOME';
-        session.tempData = {};
-        return `
-❌ *Driver Rejected Your Request*
-
-Sorry, the driver couldn't accept your ride.
-
-Type MENU to find another ride.
-        `.trim();
-      }
-
-      return 'Still waiting for driver response...\n\nType MENU if you want to cancel.';
-    } catch (error) {
-      console.error('Error checking booking:', error);
-      return 'Error checking status. Type MENU to continue.';
+    if (bk.status === 'accepted') {
+      session.state = 'SHOW_PAYMENT';
+      await saveSession(phone, session);
+      return `✅ *Driver Accepted!*\n\n${buildPaymentMessage(bookingId, session.tempData.totalCost)}`;
     }
+    if (bk.status === 'rejected') {
+      await clearSession(phone);
+      return `❌ *Driver declined your request.*\n\nType MENU to find another ride.`;
+    }
+    if (bk.status === 'expired') {
+      await clearSession(phone);
+      return `⌛ *Request timed out.*\n\nNo response from the driver.\n\nType MENU to search again — we'll find you another ride.`;
+    }
+    if (inp.toLowerCase() === 'cancel') {
+      await db.collection('bookings').doc(bookingId).update({ status: 'cancelled_by_student', cancelled_at: Date.now() });
+      const driverPhone = session.tempData.selectedRide?.driver_phone;
+      if (driverPhone) await sendMsg(driverPhone, `ℹ️ The student cancelled booking *${bookingId}* before you responded.`).catch(() => {});
+      await clearSession(phone);
+      return 'Booking cancelled.\n\nType MENU to search again.';
+    }
+    return `⏳ Still waiting for driver confirmation…\n\nBooking ID: \`${bookingId}\`\n\nType *CANCEL* to cancel this request, or *MENU* to search for a different ride.`;
   }
 
   if (state === 'SHOW_PAYMENT') {
-    if (input.toLowerCase() === 'paid') {
-      const bookingId = session.tempData.bookingId;
-      const rideId = session.tempData.selectedRide?.id;
-      const seatsBooked = Number(session.tempData.seats || 0);
-
-          await db.collection('bookings').doc(booking.id).update({
-            status: 'confirmed',
-            paid_at: new Date(),
-            txHash: paymentResult.txHash,
-            explorerUrl: paymentResult.explorerUrl
-          });
-
-      // Notify driver that payment is done
-      const driver_phone = session.tempData.selectedRide.driver_phone;
-      await sendWhatsAppMessage(`whatsapp:${driver_phone}`, `
-✅ *Payment Confirmed for Booking ${bookingId}*
-
-Passenger has paid ₦${session.tempData.totalCost}
-
-Ready to pick them up at ${session.tempData.selectedRide.from}
-Time: ${session.tempData.selectedRide.departure_time}
-      `.trim());
-
-      // Decrement available seats
-      if (rideId && seatsBooked > 0) {
-        try {
-          await db.runTransaction(async (tx) => {
-            const rideRef = db.collection('rides').doc(rideId);
-            const rideSnap = await tx.get(rideRef);
-            if (!rideSnap.exists) return;
-
-            const ride = rideSnap.data() || {};
-            const currentSeats = Number(ride.seats_available || 0);
-            const newSeats = Math.max(currentSeats - seatsBooked, 0);
-
-            tx.update(rideRef, {
-              seats_available: newSeats,
-              status: newSeats > 0 ? 'available' : 'unavailable'
-            });
-          });
-        } catch (e) {
-          console.error('Error updating seats:', e);
-        }
-      }
-
-      session.state = 'HOME';
-      session.tempData = {};
-
-      return `
-✅ *Payment Received!*
-
-Your ride is confirmed! 
-
-📍 *Pickup details:*
-Look for ${session.tempData.selectedRide?.driver_name}
-At: ${session.tempData.selectedRide?.from}
-Time: ${session.tempData.selectedRide?.departure_time}
-
-👋 Have a great ride!
-Type MENU for more options.
-      `.trim();
+    if (inp.toLowerCase() === 'paid') {
+      return `✅ Payment noted!\n\nWe're verifying with Paystack. You'll get a confirmation shortly.\n\nIf you haven't paid yet:\n${buildPaymentMessage(session.tempData.bookingId, session.tempData.totalCost)}`;
     }
-
-    return 'Reply "paid" when you have completed payment.';
+    return buildPaymentMessage(session.tempData.bookingId, session.tempData.totalCost);
   }
 
-  // ========== OFFER A RIDE (DRIVER) FLOW ==========
-  if (state === 'OFFER_RIDE_CHECK') {
-    const choice = input.toLowerCase();
-    const isYes = choice === 'a' || choice === 'yes';
-    const isNo = choice === 'b' || choice === 'no';
-
-    if (!isYes && !isNo) {
-      return 'Please reply with A or B.';
+  if (state === 'WAITING_FOR_RIDE') {
+    const lower = inp.toLowerCase();
+    if (lower === 'arrived' || lower === 'yes') {
+      const bookingId = session.tempData.bookingId;
+      await db.collection('bookings').doc(bookingId).update({ status: 'completed', completed_at: Date.now() });
+      session.state = 'RATE_RIDE_LIST';
+      session.tempData.rateBookingId = bookingId;
+      await saveSession(phone, session);
+      return `🎉 *Ride completed!*\n\nHow was your experience?\n\n1️⃣ ⭐ Poor\n2️⃣ ⭐⭐ Fair\n3️⃣ ⭐⭐⭐ Good\n4️⃣ ⭐⭐⭐⭐ Great\n5️⃣ ⭐⭐⭐⭐⭐ Excellent\n\n_Reply 1–5_`;
     }
+    if (lower === 'no' || lower === 'problem' || lower === 'issue') {
+      session.state = 'REPORT_ISSUE';
+      await saveSession(phone, session);
+      return `😟 *Report an Issue*\n\nPlease describe what happened:\n_(e.g. "Driver didn't show up", "Wrong route", "Safety concern")_`;
+    }
+    return `Your ride is confirmed and paid for! 🚗\n\nWhen your ride is done, reply:\n✅ *ARRIVED* — to confirm completion\n❌ *PROBLEM* — to report an issue`;
+  }
 
+  if (state === 'REPORT_ISSUE') {
+    const bookingId = session.tempData.bookingId || 'unknown';
+    await db.collection('issues').add({
+      phone,
+      bookingId,
+      issue: inp,
+      reported_at: Date.now(),
+      status: 'open',
+    });
+    const adminPhones = (process.env.ADMIN_PHONES || '').split(',').filter(Boolean);
+    for (const ap of adminPhones) {
+      await sendMsg(ap, `🚨 *Issue Report*\nBooking: ${bookingId}\nFrom: +${phone}\nIssue: ${inp}`).catch(() => {});
+    }
+    await clearSession(phone);
+    return `✅ Issue reported. Our team will contact you within 30 minutes.\n\nBooking ID: \`${bookingId}\`\n\nType MENU to continue.`;
+  }
+
+  // ════ OFFER A RIDE — DRIVER FLOW ════
+  if (state === 'OFFER_RIDE_CHECK') {
+    const isYes = ['a','yes'].includes(inp.toLowerCase());
     if (isYes) {
-      const userDoc = await db.collection('users').doc(phone).get();
-      const user = userDoc.data() || {};
-
-      if (userDoc.exists && user.role === 'driver' && user.driver_name) {
-        session.tempData.driver_name = user.driver_name;
+      const userDoc = await db.collection('drivers').doc(stripPlus(phone)).get();
+      if (userDoc.exists) {
+        const driver = userDoc.data();
+        session.tempData.driver_name   = driver.name;
+        session.tempData.provider_id   = driver.provider_id;
+        session.tempData.provider_name = driver.provider_name;
+        session.tempData.vehicle_type  = driver.vehicle_type;
         session.state = 'OFFER_RIDE_FROM';
-        return `
-✅ Welcome back, ${user.driver_name}!
-
-📍 Where are you starting from?
-
-🏠 Oduduwa
-🚪 Main gate
-🏬 Campus center
-🏘️ Other (type the area)
-        `.trim();
+        await saveSession(phone, session);
+        return `✅ Welcome back, *${driver.name}!*\n(${driver.provider_name || 'Independent Driver'})\n\n📍 Where are you starting from?`;
       }
     }
-
     session.state = 'OFFER_RIDE_REGISTER_NAME';
-    return `
-📍 *First-time Driver Registration*
-
-What's your driver name? (what riders will see)
-
-Example: Tunde, Blessing, Adekunle
-    `.trim();
+    await saveSession(phone, session);
+    return `📋 *Driver Registration*\n\nWhat's your full name? _(passengers will see this)_`;
   }
 
   if (state === 'OFFER_RIDE_REGISTER_NAME') {
-    const driver_name = input.trim();
-    if (!driver_name || driver_name.length < 2) {
-      return 'Please send a valid driver name (at least 2 characters).';
+    if (inp.length < 2) return 'Please enter a valid name (at least 2 characters).';
+    session.tempData.driver_name = inp;
+    session.state = 'OFFER_RIDE_REGISTER_VEHICLE';
+    await saveSession(phone, session);
+    return `👋 Hi, *${inp}!*\n\nWhat type of vehicle do you drive?\n\n1️⃣ Car (sedan/saloon)\n2️⃣ Bus / Minibus\n3️⃣ Tricycle (Keke)\n4️⃣ Motorcycle (Okada)\n\n_Reply 1–4_`;
+  }
+
+  if (state === 'OFFER_RIDE_REGISTER_VEHICLE') {
+    const vMap = { '1':'Car','2':'Bus','3':'Tricycle','4':'Motorcycle' };
+    const vehicle = vMap[inp];
+    if (!vehicle) return 'Please reply with 1, 2, 3, or 4.';
+    session.tempData.vehicle_type = vehicle;
+    session.state = 'OFFER_RIDE_REGISTER_PROVIDER';
+    await saveSession(phone, session);
+
+    const snap = await db.collection('providers').where('active', '==', true).get();
+    let msg = `🏢 *Which company do you drive for?*\n\n`;
+    const providers = [];
+    snap.forEach((doc, i) => {
+      providers.push({ id: doc.id, ...doc.data() });
+      msg += `${providers.length}. ${doc.data().name}\n`;
+    });
+    msg += `${providers.length + 1}. Independent (no company)\n\n_Reply with a number_`;
+    session.tempData._providersList = providers;
+    await saveSession(phone, session);
+    return msg;
+  }
+
+  if (state === 'OFFER_RIDE_REGISTER_PROVIDER') {
+    const providers = session.tempData._providersList || [];
+    const idx = parseInt(inp) - 1;
+    if (isNaN(idx) || idx < 0 || idx > providers.length) return `Please reply 1–${providers.length + 1}`;
+
+    if (idx === providers.length) {
+      session.tempData.provider_id   = null;
+      session.tempData.provider_name = 'Independent';
+    } else {
+      session.tempData.provider_id   = providers[idx].id;
+      session.tempData.provider_name = providers[idx].name;
     }
 
-    await db.collection('users').doc(phone).set({
-      phone,
-      role: 'driver',
-      driver_name,
-      created_at: new Date(),
-      updated_at: new Date()
+    await db.collection('drivers').doc(stripPlus(phone)).set({
+      phone:         stripPlus(phone),
+      name:          session.tempData.driver_name,
+      vehicle_type:  session.tempData.vehicle_type,
+      provider_id:   session.tempData.provider_id,
+      provider_name: session.tempData.provider_name,
+      registered_at: Date.now(),
+      rating:        5.0,
+      total_rides:   0,
+      verified:      false,
     }, { merge: true });
 
-    session.tempData.driver_name = driver_name;
     session.state = 'OFFER_RIDE_FROM';
-
-    return `
-✅ Welcome, ${driver_name}!
-
-📍 Where are you starting from?
-
-🏠 Oduduwa
-🚪 Main gate
-🏬 Campus center
-🏘️ Other (type the area)
-    `.trim();
+    delete session.tempData._providersList;
+    await saveSession(phone, session);
+    return `✅ Registered as *${session.tempData.driver_name}* (${session.tempData.provider_name})\n\n📍 Where are you starting from?`;
   }
 
   if (state === 'OFFER_RIDE_FROM') {
-    const from = input.trim();
-    if (!from || from.length < 2) {
-      return 'Please send a valid pickup location.';
-    }
-
-    session.tempData.from = from;
+    if (inp.length < 2) return 'Please enter a valid pickup location.';
+    session.tempData.from = inp;
     session.state = 'OFFER_RIDE_TO';
-
-    return `
-✅ *From:* ${from}
-
-📍 Where are you going to?
-
-🏠 Oduduwa
-🚪 Main gate
-🏬 Market
-🎓 Faculty area
-🌆 Other (type area)
-    `.trim();
+    await saveSession(phone, session);
+    return `✅ From: *${inp}*\n\n📍 Where are you going to?`;
   }
 
   if (state === 'OFFER_RIDE_TO') {
-    const to = input.trim();
-    if (!to || to.length < 2) {
-      return 'Please send a valid destination.';
-    }
-
-    session.tempData.to = to;
+    if (inp.length < 2) return 'Please enter a valid destination.';
+    session.tempData.to = inp;
     session.state = 'OFFER_RIDE_WHEN';
-
-    return `
-✅ *To:* ${to}
-
-⏰ When do you want to depart?
-
-1️⃣ Now (immediately)
-2️⃣ Today
-3️⃣ Tomorrow
-4️⃣ This week
-
-_Reply 1-4_
-    `.trim();
+    await saveSession(phone, session);
+    return `✅ To: *${inp}*\n\n⏰ Departure time?\n\n1️⃣ Now\n2️⃣ Today (later)\n3️⃣ Tomorrow\n4️⃣ This week\n\n_Reply 1–4_`;
   }
 
   if (state === 'OFFER_RIDE_WHEN') {
-    const timeMap = {
-      '1': 'now', 'now': 'now', 'immediately': 'now',
-      '2': 'today', 'today': 'today',
-      '3': 'tomorrow', 'tomorrow': 'tomorrow',
-      '4': 'thisweek', 'this week': 'thisweek', 'thisweek': 'thisweek'
-    };
-
-    const departure_time = timeMap[input.toLowerCase()];
-    if (!departure_time) {
-      return 'Please reply with 1, 2, 3, or 4.';
-    }
-
-    session.tempData.departure_time = departure_time;
+    const tMap = { '1':'Now','2':'Today','3':'Tomorrow','4':'This week','now':'Now','today':'Today','tomorrow':'Tomorrow','thisweek':'This week','this week':'This week' };
+    const dep = tMap[inp.toLowerCase()];
+    if (!dep) return 'Please reply 1, 2, 3, or 4.';
+    session.tempData.departure_time = dep;
     session.state = 'OFFER_RIDE_SEATS';
-
-    return `
-⏰ Departure: ${departure_time}
-
-🪑 How many seats are available?
-
-Reply with a number (1, 2, 3, 4, 5, etc.)
-    `.trim();
+    await saveSession(phone, session);
+    return `⏰ Departure: *${dep}*\n\n🪑 How many seats available?\n_(Reply with a number)_`;
   }
 
   if (state === 'OFFER_RIDE_SEATS') {
-    const seats = parseInt(input);
-    if (isNaN(seats) || seats < 1) {
-      return 'Please reply with a valid number (1, 2, 3, etc.)';
-    }
-
+    const seats = parseInt(inp);
+    if (isNaN(seats) || seats < 1) return 'Please reply with a valid number.';
     session.tempData.seats = seats;
     session.state = 'OFFER_RIDE_COST';
-
-    return `
-🪑 Seats: ${seats}
-
-💰 Cost per seat (₦)?
-
-Reply with a number (e.g., 50, 100, 200)
-    `.trim();
+    await saveSession(phone, session);
+    return `🪑 Seats: *${seats}*\n\n💰 Cost per seat (₦)?\n_(e.g. 100, 200, 300)_`;
   }
 
   if (state === 'OFFER_RIDE_COST') {
-    const cost_per_seat = parseFloat(input);
-    if (isNaN(cost_per_seat) || cost_per_seat <= 0) {
-      return 'Please reply with a valid cost (e.g., 50, 100, 200)';
-    }
-
-    session.tempData.cost_per_seat = cost_per_seat;
+    const cost = parseFloat(inp.replace(/[₦,]/g, ''));
+    if (isNaN(cost) || cost <= 0) return 'Please enter a valid amount (e.g. 200)';
+    session.tempData.cost_per_seat = cost;
     session.state = 'OFFER_RIDE_CONFIRM';
-
-    return `
-🚗 *Confirm your offered ride*
-
-Driver: ${session.tempData.driver_name}
-${session.tempData.from} → ${session.tempData.to}
-Departure: ${session.tempData.departure_time}
-Seats: ${session.tempData.seats}
-Cost/seat: ₦${session.tempData.cost_per_seat}
-
-Reply:
-A) Confirm
-B) Cancel
-    `.trim();
+    await saveSession(phone, session);
+    const d = session.tempData;
+    return `🚗 *Confirm Ride Offer*\n\nDriver: ${d.driver_name} (${d.provider_name || 'Independent'})\nVehicle: ${d.vehicle_type}\nRoute: ${d.from} → ${d.to}\nDeparts: ${d.departure_time}\nSeats: ${d.seats}\nCost/seat: ₦${d.cost_per_seat}\n\nA) Confirm ✅\nB) Cancel ❌\n\n_Reply A or B_`;
   }
 
   if (state === 'OFFER_RIDE_CONFIRM') {
-    const choice = input.toLowerCase();
-    const isConfirm = choice === 'a' || choice === 'yes' || choice === 'confirm';
-    const isCancel = choice === 'b' || choice === 'no' || choice === 'cancel';
+    const yes = ['a','yes','confirm'].includes(inp.toLowerCase());
+    const no  = ['b','no','cancel'].includes(inp.toLowerCase());
+    if (!yes && !no) return 'Please reply A or B.';
+    if (no) { await clearSession(phone); return 'Ride offer cancelled.\n\nType MENU to continue.'; }
 
-    if (!isConfirm && !isCancel) {
-      return 'Please reply with A or B.';
-    }
-
-    if (isCancel) {
-      session.state = 'HOME';
-      session.tempData = {};
-      return 'Ride offer cancelled. Type MENU to continue.';
-    }
-
-    // Create the ride
+    const d = session.tempData;
     const ride = {
-      driver_name: session.tempData.driver_name,
-      driver_phone: phone,
-      from: session.tempData.from,
-      to: session.tempData.to,
-      departure_time: session.tempData.departure_time,
-      seats_available: session.tempData.seats,
-      cost_per_seat: session.tempData.cost_per_seat,
-      status: 'available',
-      type: 'carpool',
-      created_at: new Date()
+      driver_name:     d.driver_name,
+      driver_phone:    stripPlus(phone),
+      provider_id:     d.provider_id   || null,
+      provider_name:   d.provider_name || 'Independent',
+      vehicle_type:    d.vehicle_type  || 'Car',
+      from:            d.from,
+      to:              d.to,
+      departure_time:  d.departure_time,
+      seats_available: d.seats,
+      cost_per_seat:   d.cost_per_seat,
+      status:          'available',
+      created_at:      Date.now(),
     };
 
-    try {
-      const docRef = await db.collection('rides').add(ride);
-      session.state = 'HOME';
-      session.tempData = {};
+    const ref = await db.collection('rides').add(ride);
+    await clearSession(phone);
 
-      return `
-✅ *Ride Offered Successfully!*
+    await db.collection('drivers').doc(stripPlus(phone)).update({
+      total_rides: admin.firestore.FieldValue.increment(1),
+    }).catch(() => {});
 
-Ride ID: ${docRef.id}
-${ride.from} → ${ride.to}
-
-Students can now book your ride!
-
-Type MENU for more options.
-      `.trim();
-    } catch (error) {
-      console.error('Error creating ride:', error);
-      session.state = 'HOME';
-      session.tempData = {};
-      return 'Error creating ride. Type MENU to try again.';
-    }
+    return `✅ *Ride Posted!*\n\nRide ID: \`${ref.id}\`\n${ride.from} → ${ride.to}\nDeparts: ${ride.departure_time}\n\nStudents can now book your ride!\n\nType MENU for more options.`;
   }
 
-  // ========== PENDING REQUESTS (DRIVER) ==========
+  // ════ PENDING REQUESTS — DRIVER ════
   if (state === 'PENDING_REQUESTS_VIEW') {
-    // Driver is viewing pending booking requests
-    const bookingNum = parseInt(input) - 1;
-    const pendingBookings = session.tempData.pendingBookings || [];
+    const idx = parseInt(inp) - 1;
+    const bookings = session.tempData.pendingBookings || [];
+    if (isNaN(idx) || idx < 0 || idx >= bookings.length) return `Please reply 1–${bookings.length}`;
 
-    if (isNaN(bookingNum) || bookingNum < 0 || bookingNum >= pendingBookings.length) {
-      return `Invalid choice. Reply 1-${pendingBookings.length}`;
-    }
-
-    const selectedBooking = pendingBookings[bookingNum];
-    session.tempData.currentBookingDecision = selectedBooking;
+    const selected = bookings[idx];
+    session.tempData.currentBooking = selected;
     session.state = 'ACCEPT_REJECT_BOOKING';
+    await saveSession(phone, session);
 
-    return `
-🔔 *Pending Request*
-
-Passenger: +${selectedBooking.phone.slice(-10)}
-From: ${selectedBooking.from}
-To: ${selectedBooking.to}
-Seats: ${selectedBooking.seats}
-Cost: ₦${selectedBooking.total_cost}
-
-Accept or Reject?
-A) Accept
-B) Reject
-
-_Reply A or B_
-    `.trim();
+    return `🔔 *Request Details*\n\nPassenger: +${selected.phone.slice(-10)}\nFrom: ${selected.from}\nTo: ${selected.to}\nSeats: ${selected.seats}\nTotal: ₦${selected.total_cost}\n\nA) ✅ Accept\nB) ❌ Reject\n\n_Reply A or B_`;
   }
 
   if (state === 'ACCEPT_REJECT_BOOKING') {
-    const choice = input.toLowerCase();
-    const isAccept = choice === 'a' || choice === 'accept' || choice === 'yes';
-    const isReject = choice === 'b' || choice === 'reject' || choice === 'no';
+    const accept = ['a','accept','yes'].includes(inp.toLowerCase());
+    const reject = ['b','reject','no'].includes(inp.toLowerCase());
+    if (!accept && !reject) return 'Please reply A or B.';
 
-    if (!isAccept && !isReject) {
-      return 'Please reply with A or B.';
-    }
-
-    const booking = session.tempData.currentBookingDecision;
-    const bookingId = booking.id;
+    const booking    = session.tempData.currentBooking;
+    const bookingId  = booking.id;
     const passengerPhone = booking.phone;
+    const driverName = session.tempData.driver_name || 'Your driver';
 
-    if (isAccept) {
-      // Update booking to accepted
+    if (accept) {
       await db.collection('bookings').doc(bookingId).update({
         status: 'accepted',
-        accepted_at: new Date()
+        accepted_at: Date.now(),
+        driver_name: driverName,
       });
 
-      // Notify passenger
-      await sendWhatsAppMessage(`whatsapp:+${passengerPhone}`, `
-✅ *Your Ride is Confirmed!*
+      const passengerSession = await getSession(passengerPhone);
+      if (passengerSession.state === 'WAITING_DRIVER_ACCEPT') {
+        passengerSession.state = 'SHOW_PAYMENT';
+        await saveSession(passengerPhone, passengerSession);
+      }
 
-Driver has accepted your request!
+      await sendMsg(passengerPhone, `✅ *Driver Accepted Your Request!*\n\nDriver: *${driverName}*\nBooking: \`${bookingId}\`\n\n${buildPaymentMessage(bookingId, booking.total_cost)}`).catch(() => {});
 
-Booking ID: ${bookingId}
-Driver: ${session.tempData.driver_name}
-Pickup: ${booking.from}
-Dropoff: ${booking.to}
-
-Proceed to payment.
-      `.trim());
-
-      session.state = 'HOME';
-      session.tempData = {};
-
-      return `
-✅ *Booking Accepted!*
-
-Passenger notified. They will proceed to payment.
-
-Type MENU for more options.
-      `.trim();
+      await clearSession(phone);
+      return `✅ *Booking Accepted*\n\nPassenger has been sent the payment link.\n\nYou'll be notified when they pay.\n\nType MENU for more.`;
     }
 
-    if (isReject) {
-      // Update booking to rejected
+    if (reject) {
       await db.collection('bookings').doc(bookingId).update({
         status: 'rejected',
-        rejected_at: new Date()
+        rejected_at: Date.now(),
       });
-
-      // Notify passenger
-      await sendWhatsAppMessage(`whatsapp:+${passengerPhone}`, `
-❌ *Ride Rejected*
-
-Sorry, the driver couldn't accept your ride.
-
-Booking ID: ${bookingId}
-
-Type MENU to search for another ride.
-      `.trim());
-
-      session.state = 'HOME';
-      session.tempData = {};
-
-      return `
-✅ *Booking Rejected*
-
-Passenger notified. 
-
-Type MENU for more options.
-      `.trim();
+      await sendMsg(passengerPhone, `❌ *Request Declined*\n\nSorry — ${driverName} couldn't accept your ride.\n\nType MENU to search for another ride.`).catch(() => {});
+      await clearSession(phone);
+      return `✅ *Booking Rejected*\n\nPassenger has been notified.\n\nType MENU for more.`;
     }
   }
 
-  // ========== RATE A RIDE FLOW ==========
+  // ════ RATE RIDE ════
   if (state === 'RATE_RIDE_LIST') {
-    const rating = parseInt(input);
-    if (![1, 2, 3, 4, 5].includes(rating)) {
-      return 'Please reply with a rating: 1, 2, 3, 4, or 5.';
-    }
+    const rating = parseInt(inp);
+    if (![1,2,3,4,5].includes(rating)) return 'Please reply 1, 2, 3, 4, or 5.';
 
     const bookingId = session.tempData.rateBookingId;
-    if (!bookingId) {
-      session.state = 'MENU_CHOICE';
-      return 'No booking found to rate. Type MENU and try again.';
-    }
-
-    try {
-      await db.collection('bookings').doc(bookingId).update({
-        rider_rating: rating,
-        rated_at: new Date(),
-        status: 'completed'
-      });
-
-      session.state = 'HOME';
-      session.tempData = {};
-
-      return `
-🙏 *Thanks for rating!*
-
-Your rating has been saved.
-
-Type MENU to continue.
-      `.trim();
-    } catch (error) {
-      console.error('Error rating:', error);
-      session.state = 'HOME';
-      session.tempData = {};
-      return 'Error saving rating. Type MENU to continue.';
-    }
-  }
-
-  // Fallback
-  session.state = 'HOME';
-  session.tempData = {};
-  return 'Something went wrong. Type MENU to restart.';
-}
-
-// ============================================
-// HELPER FUNCTIONS
-// ============================================
-
-async function searchRides(from, to, when) {
-  try {
-    const snapshot = await db.collection('rides').where('status', '==', 'available').get();
-    const rides = [];
-
-    const fromQ = normalizeText(from);
-    const toQ = normalizeText(to);
-
-    snapshot.forEach(doc => {
-      const ride = doc.data();
-      const rideFrom = normalizeText(ride.from);
-      const rideTo = normalizeText(ride.to);
-
-      if (rideFrom.includes(fromQ) && rideTo.includes(toQ)) {
-        rides.push({
-          id: doc.id,
-          ...ride
-        });
-      }
+    await db.collection('bookings').doc(bookingId).update({
+      rider_rating: rating,
+      rated_at:     Date.now(),
+      status:       'completed',
     });
 
-    return rides;
-  } catch (error) {
-    console.error('Search error:', error);
+    const bSnap = await db.collection('bookings').doc(bookingId).get();
+    const dPhone = bSnap.data()?.driver_phone;
+    if (dPhone) await updateDriverRating(dPhone, rating);
+
+    await clearSession(phone);
+    return `🙏 *Thanks for rating!*\n\nYour feedback helps keep Campus Move reliable.\n\nType MENU to continue.`;
+  }
+
+  await clearSession(phone);
+  return `Something went wrong. Type *MENU* to restart.`;
+}
+
+// ─────────────────────────────────────────────
+// DRIVER COMMANDS
+// ─────────────────────────────────────────────
+async function handleDriverClose(phone, bookingId) {
+  const snap = await db.collection('bookings').doc(bookingId).get();
+  if (!snap.exists) {
+    await sendMsg(phone, `Booking ${bookingId} not found.`).catch(() => {});
+    return;
+  }
+  const booking = snap.data();
+
+  const driverSnap = await db.collection('drivers').doc(stripPlus(phone)).get();
+  const driverName = driverSnap.exists ? driverSnap.data().name : 'Your driver';
+
+  await sendMsg(booking.phone, `🚗 *Driver is nearby!*\n\n*${driverName}* is approaching your pickup point.\n\nPlease make your way outside now.\n\nBooking: \`${bookingId}\``).catch(() => {});
+  await sendMsg(phone, `✅ Student notified for booking ${bookingId}`).catch(() => {});
+}
+
+async function handleDriverCancelBooking(phone, bookingId) {
+  const snap = await db.collection('bookings').doc(bookingId).get();
+  if (!snap.exists) {
+    await sendMsg(phone, `Booking ${bookingId} not found.`).catch(() => {});
+    return;
+  }
+
+  const booking = snap.data();
+  if (!['accepted','confirmed'].includes(booking.status)) {
+    await sendMsg(phone, `Cannot cancel — booking status is "${booking.status}".`).catch(() => {});
+    return;
+  }
+
+  await db.collection('bookings').doc(bookingId).update({
+    status: 'cancelled_by_driver',
+    cancelled_at: Date.now(),
+  });
+
+  await sendMsg(booking.phone, `😔 *Ride Cancelled*\n\nSorry — your driver had to cancel booking \`${bookingId}\`.\n\nIf you were charged, a full refund will be processed within 1 hour.\n\nType MENU to find another ride.`).catch(() => {});
+
+  const adminPhones = (process.env.ADMIN_PHONES || '').split(',').filter(Boolean);
+  for (const ap of adminPhones) {
+    await sendMsg(ap, `⚠️ Driver Cancellation\nBooking: ${bookingId}\nDriver: +${phone}\nStudent: +${booking.phone}\nStatus was: ${booking.status}`).catch(() => {});
+  }
+
+  await sendMsg(phone, `✅ Booking ${bookingId} cancelled. Student has been notified.\n\nType MENU to continue.`).catch(() => {});
+}
+
+// ─────────────────────────────────────────────
+// BOOKING TIMEOUT
+// ─────────────────────────────────────────────
+function scheduleBookingTimeout(bookingId, studentPhone, driverPhone) {
+  const TIMEOUT_MS = 5 * 60 * 1000;
+
+  setTimeout(async () => {
+    try {
+      const snap = await db.collection('bookings').doc(bookingId).get();
+      if (!snap.exists) return;
+      const booking = snap.data();
+
+      if (booking.status !== 'pending') return;
+
+      await db.collection('bookings').doc(bookingId).update({
+        status: 'expired',
+        expired_at: Date.now(),
+      });
+
+      await sendMsg(studentPhone, `⌛ *Request timed out*\n\nThe driver didn't respond to booking \`${bookingId}\` in time.\n\nType MENU to find another ride — we have other options for you!`).catch(() => {});
+      await sendMsg(driverPhone, `ℹ️ Booking *${bookingId}* expired — student waited 5 minutes with no response.`).catch(() => {});
+
+    } catch (err) {
+      console.error('Timeout handler error:', err);
+    }
+  }, TIMEOUT_MS);
+}
+
+// ─────────────────────────────────────────────
+// POST-PAYMENT RIDE TRACKING
+// ─────────────────────────────────────────────
+async function startRideTracking(bookingId, studentPhone) {
+  const CHECK_MS = 15 * 60 * 1000;
+
+  setTimeout(async () => {
+    try {
+      const snap = await db.collection('bookings').doc(bookingId).get();
+      if (!snap.exists) return;
+      const b = snap.data();
+      if (['completed','cancelled_by_driver','refunded'].includes(b.status)) return;
+
+      const session = await getSession(studentPhone);
+      if (session.state !== 'HOME' && session.state !== 'MENU_CHOICE') return;
+
+      session.state = 'WAITING_FOR_RIDE';
+      session.tempData.bookingId = bookingId;
+      await saveSession(studentPhone, session);
+
+      await sendMsg(studentPhone, `👋 *How's your ride going?*\n\nBooking: \`${bookingId}\`\n\nReply:\n✅ *ARRIVED* — ride completed\n❌ *PROBLEM* — something went wrong`).catch(() => {});
+    } catch (err) {
+      console.error('Ride tracking error:', err);
+    }
+  }, CHECK_MS);
+}
+
+// ─────────────────────────────────────────────
+// HELPER FUNCTIONS
+// ─────────────────────────────────────────────
+
+async function searchRides(from, to, _when) {
+  try {
+    const snap = await db.collection('rides').where('status', '==', 'available').get();
+    const fq   = norm(from);
+    const tq   = norm(to);
+    const results = [];
+    snap.forEach(doc => {
+      const r = doc.data();
+      if (norm(r.from).includes(fq) && norm(r.to).includes(tq)) {
+        results.push({ id: doc.id, ...r });
+      }
+    });
+    return results;
+  } catch (e) {
+    console.error('Search error:', e);
     return [];
   }
 }
 
-function normalizeText(value) {
-  return String(value || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9 ]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+function norm(str) {
+  return String(str || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
 }
 
 async function createBooking(phone, tempData) {
   const booking = {
-    phone,
-    ride_id: tempData.selectedRide?.id || '',
-    seats: tempData.seats || 1,
-    total_cost: tempData.totalCost || 0,
-    status: 'pending', // Changed from 'pending' - now driver must accept
-    from: tempData.from || '',
-    to: tempData.to || '',
-    created_at: new Date()
+    phone:       stripPlus(phone),
+    ride_id:     tempData.selectedRide?.id    || '',
+    driver_phone:tempData.selectedRide?.driver_phone || '',
+    seats:       tempData.seats       || 1,
+    total_cost:  tempData.totalCost   || 0,
+    from:        tempData.from        || '',
+    to:          tempData.to          || '',
+    status:      'pending',
+    created_at:  Date.now(),
   };
-
-  const docRef = await db.collection('bookings').add(booking);
-  return { id: docRef.id, ...booking };
+  const ref = await db.collection('bookings').add(booking);
+  return { id: ref.id, ...booking };
 }
 
-async function notifyDriverPendingRequest(driver_phone, booking) {
-  const message = `
-🔔 *New Ride Request*
+async function notifyDriver(driverPhone, booking, ride) {
+  const msg = `🔔 *New Ride Request!*\n\nPassenger: +${booking.phone.slice(-10)}\nFrom: ${booking.from}\nTo: ${booking.to}\nSeats: ${booking.seats}\nTotal: ₦${booking.total_cost}\nBooking: \`${booking.id}\`\n\nGo to Menu → *Option 4* to Accept or Reject\n⏱️ You have 5 minutes!`;
+  await sendMsg(driverPhone, msg).catch(e => console.error('Driver notify error:', e));
+}
 
-Passenger: +${booking.phone.slice(-10)}
-From: ${booking.from}
-To: ${booking.to}
-Seats: ${booking.seats}
-Total: ₦${booking.total_cost}
-
-Go to Menu → Option 4 to accept or reject!
-  `.trim();
-
-  await sendWhatsAppMessage(`whatsapp:+${driver_phone}`, message).catch(e => console.error('Error notifying driver:', e));
+async function batchInQuery(collection, field, values, ...conditions) {
+  const CHUNK = 10;
+  const results = [];
+  for (let i = 0; i < values.length; i += CHUNK) {
+    const chunk = values.slice(i, i + CHUNK);
+    let q = db.collection(collection).where(field, 'in', chunk);
+    for (const [f, op, v] of conditions) q = q.where(f, op, v);
+    const snap = await q.get();
+    snap.forEach(doc => results.push({ id: doc.id, ...doc.data() }));
+  }
+  return results;
 }
 
 async function showPendingRequests(phone, session) {
   try {
-    // Get rides offered by this driver
-    const ridesSnapshot = await db.collection('rides')
-      .where('driver_phone', '==', phone)
-      .get();
+    const ridesSnap = await db.collection('rides')
+      .where('driver_phone', '==', stripPlus(phone)).get();
 
-    const rideIds = ridesSnapshot.docs.map(doc => doc.id);
-
+    const rideIds = ridesSnap.docs.map(d => d.id);
     if (rideIds.length === 0) {
-      return 'You haven\'t offered any rides yet. Type MENU and choose option 2 to offer a ride!';
+      session.state = 'MENU_CHOICE';
+      await saveSession(phone, session);
+      return 'You haven\'t posted any rides yet.\n\nType MENU → Option 2 to offer a ride!';
     }
 
-    // Get pending bookings for these rides
-    const bookingsSnapshot = await db.collection('bookings')
-      .where('ride_id', 'in', rideIds)
-      .where('status', '==', 'pending')
-      .get();
+    const pending = await batchInQuery('bookings', 'ride_id', rideIds, ['status', '==', 'pending']);
 
-    if (bookingsSnapshot.empty) {
-      return 'No pending requests at the moment.';
+    if (pending.length === 0) {
+      session.state = 'MENU_CHOICE';
+      await saveSession(phone, session);
+      return 'No pending requests right now. 🎉\n\nType MENU for more options.';
     }
 
-    let response = `🔔 *Pending Requests* (${bookingsSnapshot.size})\n\n`;
-    const pendingBookings = [];
-
-    bookingsSnapshot.forEach((doc, i) => {
-      const booking = doc.data();
-      pendingBookings.push({ id: doc.id, ...booking });
-
-      response += `${i + 1}. +${booking.phone.slice(-10)}
-From: ${booking.from}
-Seats: ${booking.seats} | ₦${booking.total_cost}
-\n`;
+    let msg = `🔔 *Pending Requests* (${pending.length})\n\n`;
+    pending.forEach((b, i) => {
+      msg += `*${i+1}.* +${b.phone.slice(-10)}\n   ${b.from} → ${b.to} | ${b.seats} seat(s) | ₦${b.total_cost}\n\n`;
     });
+    msg += `_Reply with number to review_`;
 
-    response += `_Reply with number to accept/reject_`;
+    const driverSnap = await db.collection('drivers').doc(stripPlus(phone)).get();
+    if (driverSnap.exists) session.tempData.driver_name = driverSnap.data().name;
 
-    session.tempData.pendingBookings = pendingBookings;
+    session.tempData.pendingBookings = pending;
     session.state = 'PENDING_REQUESTS_VIEW';
-
-    return response;
-  } catch (error) {
-    console.error('Error loading pending requests:', error);
-    session.state = 'MENU_CHOICE';
+    await saveSession(phone, session);
+    return msg;
+  } catch (err) {
+    console.error('Pending requests error:', err);
     return 'Error loading requests. Type MENU to continue.';
   }
 }
 
 async function showMyBookings(phone) {
   try {
-    const snapshot = await db.collection('bookings')
-      .where('phone', '==', phone)
+    const snap = await db.collection('bookings')
+      .where('phone', '==', stripPlus(phone))
       .orderBy('created_at', 'desc')
-      .limit(5)
-      .get();
+      .limit(5).get();
 
-    if (snapshot.empty) {
-      return '📋 No bookings yet. Type MENU and choose option 1 to find a ride!';
-    }
+    if (snap.empty) return '📋 No bookings yet.\n\nType MENU → Option 1 to find a ride!';
 
-    let response = '📋 *Your Recent Bookings*\n\n';
-
-    snapshot.forEach((doc, i) => {
-      const booking = doc.data();
-      response += `${i + 1}. ${booking.from} → ${booking.to}\n`;
-      response += `Status: ${booking.status.toUpperCase()} | ₦${booking.total_cost}\n\n`;
+    let msg = '📋 *Your Recent Bookings*\n\n';
+    snap.forEach((doc, i) => {
+      const b = doc.data();
+      const statusEmoji = { confirmed:'✅', pending:'⏳', rejected:'❌', expired:'⌛', completed:'🏁', cancelled_by_driver:'🔴', cancelled_by_student:'🔴' };
+      msg += `*${i+1}.* ${b.from} → ${b.to}\n   ${statusEmoji[b.status] || '❓'} ${b.status.toUpperCase()} | ₦${b.total_cost}\n\n`;
     });
-
-    response += 'Type MENU to go back.';
-    return response;
-  } catch (error) {
-    console.error('Error loading bookings:', error);
+    msg += 'Type MENU to go back.';
+    return msg;
+  } catch (e) {
     return 'Error loading bookings. Type MENU to continue.';
   }
 }
 
 async function showProfile(phone) {
   try {
-    const userDoc = await db.collection('users').doc(phone).get();
-    const user = userDoc.data() || {};
+    const [driverSnap, bookingsSnap] = await Promise.all([
+      db.collection('drivers').doc(stripPlus(phone)).get(),
+      db.collection('bookings').where('phone', '==', stripPlus(phone)).get(),
+    ]);
 
-    const bookingsSnapshot = await db.collection('bookings')
-      .where('phone', '==', phone)
-      .get();
+    let msg = `👤 *Your Profile*\n\n📞 ${phone}\n`;
+    msg += `🎫 Rides Booked: ${bookingsSnap.size}\n`;
 
-    let profile = `👤 *Your Profile*\n\n`;
-    profile += `📞 Phone: ${phone}\n`;
-    profile += `🎫 Rides Booked: ${bookingsSnapshot.size}\n`;
-    profile += `⭐ Rating: ${user.rating ? user.rating.toFixed(1) : 'N/A'}\n`;
-
-    if (user.role === 'driver') {
-      profile += `🚗 Driver Name: ${user.driver_name || 'N/A'}\n`;
-      profile += `🚙 Rides Offered: ${user.rides_offered || 0}\n`;
+    if (driverSnap.exists) {
+      const d = driverSnap.data();
+      msg += `\n🚗 *Driver Account*\n`;
+      msg += `Name: ${d.name}\n`;
+      msg += `Vehicle: ${d.vehicle_type}\n`;
+      msg += `Provider: ${d.provider_name || 'Independent'}\n`;
+      msg += `Total Rides: ${d.total_rides || 0}\n`;
+      msg += `Rating: ${d.rating ? d.rating.toFixed(1) : 'N/A'} ⭐\n`;
+      msg += `Verified: ${d.verified ? '✅' : '⏳ Pending'}\n`;
     }
 
-    profile += `📅 Member since: ${user.created_at ? new Date(user.created_at).toLocaleDateString() : 'New'}\n\n`;
-    profile += 'Type MENU to go back.';
-
-    return profile;
-  } catch (error) {
-    console.error('Error loading profile:', error);
+    msg += `\nType MENU to go back.`;
+    return msg;
+  } catch (e) {
     return 'Error loading profile. Type MENU to continue.';
   }
 }
 
 async function showRidesToRate(phone, session) {
   try {
-    const snapshot = await db.collection('bookings')
-      .where('phone', '==', phone)
+    const snap = await db.collection('bookings')
+      .where('phone', '==', stripPlus(phone))
       .where('status', '==', 'confirmed')
       .orderBy('created_at', 'desc')
-      .limit(1)
-      .get();
+      .limit(1).get();
 
-    if (snapshot.empty) {
+    if (snap.empty) {
       session.state = 'MENU_CHOICE';
-      return '⭐ No confirmed rides to rate yet. Type MENU to continue.';
+      await saveSession(phone, session);
+      return '⭐ No rides to rate yet.\n\nType MENU to continue.';
     }
 
-    const bookingSnap = snapshot.docs[0];
-    const booking = bookingSnap.data();
-
-    session.tempData.rateBookingId = bookingSnap.id;
+    const doc = snap.docs[0];
+    const b   = doc.data();
+    session.tempData.rateBookingId = doc.id;
     session.state = 'RATE_RIDE_LIST';
+    await saveSession(phone, session);
 
-    return `
-⭐ *Rate Your Ride*
-
-Ride: ${booking.from} → ${booking.to}
-
-How would you rate it?
-
-1️⃣ ⭐ (Poor)
-2️⃣ ⭐⭐ (Fair)
-3️⃣ ⭐⭐⭐ (Good)
-4️⃣ ⭐⭐⭐⭐ (Great)
-5️⃣ ⭐⭐⭐⭐⭐ (Excellent)
-
-_Reply 1-5_
-    `.trim();
-  } catch (error) {
-    console.error('Error loading rides to rate:', error);
-    session.state = 'MENU_CHOICE';
+    return `⭐ *Rate Your Ride*\n\n${b.from} → ${b.to}\n\n1️⃣ ⭐ Poor\n2️⃣ ⭐⭐ Fair\n3️⃣ ⭐⭐⭐ Good\n4️⃣ ⭐⭐⭐⭐ Great\n5️⃣ ⭐⭐⭐⭐⭐ Excellent\n\n_Reply 1–5_`;
+  } catch (e) {
     return 'Error loading rides. Type MENU to continue.';
   }
 }
 
-function showHelp() {
-  return `
-❓ *Help & Support*
-
-*Student:*
-1️⃣ Find a ride → Menu → Option 1
-2️⃣ Book and pay → Follow prompts
-3️⃣ Driver accepts/rejects → Wait for notification
-
-*Driver:*
-1️⃣ Offer a ride → Menu → Option 2
-2️⃣ Check requests → Menu → Option 4
-3️⃣ Accept/Reject → Respond to pending requests
-
-*Payment:*
-- Bank transfer or USSD after booking
-
-*Support:*
-📞 Available 8AM - 8PM
-
-Type MENU to go back.
-  `.trim();
-}
-
-// ============================================
-// UTILITY FUNCTIONS
-// ============================================
-
-async function sendWhatsAppMessage(to, body) {
+async function updateDriverRating(driverPhone, newRating) {
+  const ref = db.collection('drivers').doc(stripPlus(driverPhone));
   try {
-    const message = await client.messages.create({
-      body,
-      from: `whatsapp:${twilioWhatsAppNumber}`,
-      to
+    await db.runTransaction(async tx => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return;
+      const d = snap.data();
+      const total = (d.total_ratings || 0) + 1;
+      const avg   = ((d.rating || 5) * (total - 1) + newRating) / total;
+      tx.update(ref, { rating: Math.round(avg * 10) / 10, total_ratings: total });
     });
-    console.log(`✅ Message sent: ${message.sid}`);
-    return message.sid;
-  } catch (error) {
-    console.error('❌ Error sending message:', error);
-    throw error;
+  } catch (e) {
+    console.error('Rating update error:', e);
   }
 }
 
-// ============================================
-// ADMIN ENDPOINTS
-// ============================================
+function showHelp() {
+  return `❓ *Campus Move Help*
 
-app.post('/api/admin/add-ride', express.json(), async (req, res) => {
-  const { driver_name, from, to, departure_time, seats, cost_per_seat, driver_phone } = req.body;
+*Students:*
+• Menu → 1 to find & book a ride
+• Menu → 3 to see your bookings
+• Menu → 5 to rate a completed ride
 
+*Drivers:*
+• Menu → 2 to post a ride
+• Menu → 4 to see pending requests
+• Text: \`CLOSE <bookingID>\` when you're approaching pickup
+• Text: \`CANCEL_BOOKING <bookingID>\` to cancel an accepted booking
+
+*Payments:*
+• Pay via Paystack link after driver accepts
+• Refund issues? Contact support below
+
+📞 Support: ${process.env.SUPPORT_PHONE || 'Contact admin'}
+⏰ Available 7AM–10PM daily
+
+Type MENU to go back.`.trim();
+}
+
+// ─────────────────────────────────────────────
+// PAYSTACK WEBHOOK
+// ─────────────────────────────────────────────
+async function handlePaystackWebhook(req, res) {
   try {
-    const ride = {
-      driver_name,
-      from,
-      to,
-      departure_time,
-      seats_available: seats,
-      cost_per_seat,
-      driver_phone,
-      status: 'available',
-      type: 'carpool',
-      created_at: new Date()
-    };
+    const sig = req.headers['x-paystack-signature'];
+    if (!verifyWebhookSignature(req.body, sig)) {
+      return res.sendStatus(401);
+    }
 
-    const docRef = await db.collection('rides').add(ride);
-    res.json({ success: true, ride_id: docRef.id });
-  } catch (error) {
-    console.error('Admin endpoint error:', error);
-    res.status(500).json({ error: error.message });
+    const event = JSON.parse(req.body.toString());
+
+    if (event.event === 'charge.success') {
+      const { reference, amount, channel, paid_at } = event.data;
+      const amountNaira = amount / 100;
+
+      const snap = await db.collection('bookings').doc(reference).get();
+      if (!snap.exists) return res.sendStatus(200);
+
+      const booking = snap.data();
+
+      if (booking.status === 'confirmed') return res.sendStatus(200);
+
+      if (booking.status !== 'accepted') {
+        console.warn(`Payment for booking ${reference} but status is ${booking.status}`);
+        return res.sendStatus(200);
+      }
+
+      const rideSnap = booking.ride_id ? await db.collection('rides').doc(booking.ride_id).get() : null;
+      const ride     = rideSnap?.exists ? rideSnap.data() : {};
+
+      await db.collection('bookings').doc(reference).update({
+        status:            'confirmed',
+        paid_at:           Date.now(),
+        payment_method:    channel || 'paystack',
+        payment_reference: reference,
+        amount_paid:       amountNaira,
+      });
+
+      await storeReceipt(reference, reference, amountNaira, event.data).catch(() => {});
+
+      if (booking.ride_id && booking.seats > 0) {
+        await db.runTransaction(async tx => {
+          const rRef  = db.collection('rides').doc(booking.ride_id);
+          const rSnap = await tx.get(rRef);
+          if (!rSnap.exists) return;
+          const cur = Number(rSnap.data().seats_available || 0);
+          const nxt = Math.max(cur - booking.seats, 0);
+          tx.update(rRef, {
+            seats_available: nxt,
+            status: nxt > 0 ? 'available' : 'unavailable',
+          });
+        });
+      }
+
+      const studentPhone = booking.phone;
+      await sendMsg(studentPhone, `✅ *Payment Confirmed! ₦${amountNaira}*\n\nBooking: \`${reference}\`\nDriver: ${ride.driver_name || 'Your driver'}\nPickup: ${booking.from}\n\nYour driver has been notified.\n\n💡 Tip: You'll get a check-in message in 15 minutes.`).catch(() => {});
+
+      if (ride.driver_phone) {
+        await sendMsg(ride.driver_phone, `💰 *Payment Received!*\n\nStudent paid ₦${amountNaira} for booking \`${reference}\`\n\nPickup: ${booking.from}\nDrop-off: ${booking.to}\nTime: ${ride.departure_time}\n\nWhen approaching pickup, text:\n*CLOSE ${reference}*`).catch(() => {});
+      }
+
+      startRideTracking(reference, studentPhone);
+    }
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error('Paystack webhook error:', err);
+    res.sendStatus(500);
+  }
+}
+
+// ─────────────────────────────────────────────
+// ADMIN HTTP ENDPOINTS
+// ─────────────────────────────────────────────
+app.post('/api/admin/add-ride', async (req, res) => {
+  const { driver_name, driver_phone, provider_id, provider_name, vehicle_type, from, to, departure_time, seats, cost_per_seat } = req.body;
+  try {
+    const ref = await db.collection('rides').add({
+      driver_name,
+      driver_phone: stripPlus(driver_phone),
+      provider_id:   provider_id   || null,
+      provider_name: provider_name || 'Independent',
+      vehicle_type:  vehicle_type  || 'Car',
+      from, to, departure_time,
+      seats_available: Number(seats),
+      cost_per_seat:   Number(cost_per_seat),
+      status:     'available',
+      created_at: Date.now(),
+    });
+    res.json({ success: true, ride_id: ref.id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-app.get('/api/admin/stats', async (req, res) => {
+app.post('/api/admin/add-provider', async (req, res) => {
+  const { id, name, type, contact_phone } = req.body;
   try {
-    const ridesSnapshot = await db.collection('rides').get();
-    const bookingsSnapshot = await db.collection('bookings').get();
-    const usersSnapshot = await db.collection('users').get();
+    await db.collection('providers').doc(id).set({ name, type, contact_phone, active: true, created_at: Date.now() });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
-    const totalRevenue = bookingsSnapshot.docs
-      .filter(d => ['confirmed', 'completed'].includes((d.data().status || '').toLowerCase()))
-      .reduce((sum, d) => sum + (Number(d.data().total_cost) || 0), 0);
+app.get('/api/admin/stats', async (_req, res) => {
+  try {
+    const [rides, bookings, users, drivers] = await Promise.all([
+      db.collection('rides').get(),
+      db.collection('bookings').get(),
+      db.collection('sessions').get(),
+      db.collection('drivers').get(),
+    ]);
+
+    const byStatus = {};
+    let revenue = 0;
+    bookings.forEach(doc => {
+      const b = doc.data();
+      byStatus[b.status] = (byStatus[b.status] || 0) + 1;
+      if (['confirmed','completed'].includes(b.status)) revenue += Number(b.total_cost || 0);
+    });
 
     res.json({
-      total_rides: ridesSnapshot.size,
-      total_bookings: bookingsSnapshot.size,
-      total_users: usersSnapshot.size,
-      total_revenue: totalRevenue
+      total_rides:    rides.size,
+      total_bookings: bookings.size,
+      total_sessions: users.size,
+      total_drivers:  drivers.size,
+      total_revenue:  revenue,
+      bookings_by_status: byStatus,
     });
-  } catch (error) {
-    console.error('Stats endpoint error:', error);
-    res.status(500).json({ error: error.message });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ============================================
-// START SERVER
-// ============================================
-
-// Check if we are running on Vercel (Vercel sets the VERCEL environment variable)
+// ─────────────────────────────────────────────
+// START SERVER & BOT
+// ─────────────────────────────────────────────
 if (process.env.NODE_ENV !== 'production') {
   const PORT = process.env.PORT || 3000;
+  
+  // Start bot
+  startWhatsApp().catch(err => {
+    console.error('❌ Failed to start WhatsApp bot:', err);
+    process.exit(1);
+  });
+
+  // Start server
   app.listen(PORT, () => {
-    console.log(`
-  ╔═══════════════════════════════════╗
-  ║  🚗 CampusMove Bot Running! 🚗    ║
-  ╚═══════════════════════════════════╝
-  
-  📱 WhatsApp webhook: POST /whatsapp
-  📊 Admin stats: GET /api/admin/stats
-  ➕ Add ride: POST /api/admin/add-ride
-  
-  🌍 Expose with: ngrok http 3000
-    `);
+    console.log(`\n🚗 CampusMove Bot v2.0 running on :${PORT}\n`
+      + `   Paystack: POST /api/paystack/webhook\n`
+      + `   Stats:    GET  /api/admin/stats\n`
+      + `\n   Scan QR above to connect WhatsApp\n`);
   });
 }
 
-// CRITICAL: Vercel needs this line to work
 module.exports = app;

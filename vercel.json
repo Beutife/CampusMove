@@ -1,7 +1,23 @@
 {
-    "version": 2,
-    "rewrites": [
-      { "source": "/whatsapp", "destination": "/api/index.js" },
-      { "source": "/(.*)", "destination": "/api/index.js" }
-    ]
-  }
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/index.js",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    { "src": "/whatsapp", "dest": "/api/index.js" },
+    { "src": "/api/(.*)", "dest": "/api/index.js" },
+    { "src": "/", "dest": "/api/index.js" }
+  ],
+  "env": {
+    "NODE_ENV": "production"
+  },
+  "crons": [
+    {
+      "path": "/api/admin/cleanup-expired",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+}
