@@ -47,9 +47,9 @@ function getFirebaseCredential() {
     throw new Error('Missing Firebase credentials.');
   }
   return admin.credential.cert({
-    projectId:   FIREBASE_PROJECT_ID,
-    clientEmail: FIREBASE_CLIENT_EMAIL,
-    privateKey:  normalizePrivateKey(FIREBASE_PRIVATE_KEY),
+    projectId:   process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    privateKey:  normalizePrivateKey(process.env.FIREBASE_PRIVATE_KEY),
   });
 }
 
