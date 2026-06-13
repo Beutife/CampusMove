@@ -16,7 +16,6 @@ const {
   makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion,
   Browsers,
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
@@ -91,8 +90,8 @@ async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
  
   // Fetch the latest WA version — required for Baileys v7+
-  const { version } = await fetchLatestBaileysVersion();
- 
+  const version = [2, 3000, 1015901307]; 
+
   console.log(`📱 Baileys starting with WA v${version.join('.')}`);
  
   sock = makeWASocket({
