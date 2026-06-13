@@ -84,6 +84,7 @@ app.get('/', (_req, res) => res.json({
 let sock; // global WhatsApp socket — set when startWhatsApp() connects
 
 async function startWhatsApp() {
+  try{
   const authDir = path.join(__dirname, '..', '.wa_auth');
   fs.mkdirSync(authDir, { recursive: true });
  
@@ -192,6 +193,14 @@ async function startWhatsApp() {
     }
   });
 }
+  catch (criticalError){
+    console.error("❌ CRITICAL EXCEPTION DURING STARTUP:");
+    console.error(criticalError.message);
+    console.error(criticalError.stack);
+    console.log("Holding container open for debugging logs...");
+  }
+}
+
 
 // ─────────────────────────────────────────────
 // PHONE HELPERS
