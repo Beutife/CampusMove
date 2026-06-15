@@ -16,6 +16,7 @@ const {
   makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
+  fetchLatestBaileysVersion,
   Browsers,
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
@@ -25,6 +26,7 @@ const { buildPaymentMessage, verifyWebhookSignature } = require('../utils/paymen
 const { storeReceipt } = require('../utils/verificationService');
 
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+process.stdout._handle && process.stdout._handle.setBlocking && process.stdout._handle.setBlocking(true);
 
 // ─────────────────────────────────────────────
 // FIREBASE INIT
@@ -83,120 +85,118 @@ app.get('/', (_req, res) => res.json({
 let sock; // global WhatsApp socket — set when startWhatsApp() connects
 
 async function startWhatsApp() {
-  try{
-  const authDir = path.join(__dirname, '..', '.wa_auth');
-  fs.mkdirSync(authDir, { recursive: true });
- 
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
- 
-  // Fetch the latest WA version — required for Baileys v7+
-  const version = [2, 3000, 1015901307]; 
+  try {
+    const authDir = path.join(__dirname, '..', '.wa_auth');
+    fs.mkdirSync(authDir, { recursive: true });
 
-  console.log(`📱 Baileys starting with WA v${version.join('.')}`);
- 
-  sock = makeWASocket({
-    version,
-    auth:  state,
-    // Do NOT use printQRInTerminal — we render it ourselves below for reliability
-    printQRInTerminal: false,
-    logger: pino({ level: 'silent' }),
-    // Use Baileys v7 standard browser fingerprint — fixes 405 Connection Failure
-    browser: Browsers.appropriate('Chrome'),
-    // Prevent premature disconnects
-    connectTimeoutMs:    60_000,
-    keepAliveIntervalMs: 25_000,
-    retryRequestDelayMs: 2_000,
-    maxMsgRetryCount: 5,
-  });
- 
-  sock.ev.on('creds.update', saveCreds);
- 
-  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-    // QR code received — render it ourselves using qrcode-terminal
-    if (qr) {
-      console.log('\n📱 ══════════════════════════════════════════════');
-      console.log('    SCAN THIS QR CODE IN WHATSAPP NOW');
-      console.log('    WhatsApp → Settings → Linked Devices');
-      console.log('    → Link a Device → scan the code below');
-      console.log('════════════════════════════════════════════════\n');
-      qrcode.generate(qr, { small: true });
-      console.log('\n════════════════════════════════════════════════');
-      console.log('    ☝️  Scan the QR above within 60 seconds');
-      console.log('════════════════════════════════════════════════\n');
-    }
- 
-    if (connection === 'open') {
-      console.log('\n✅ ══════════════════════════════════');
-      console.log('   WHATSAPP CONNECTED!');
-      console.log('   CampusMove bot is LIVE 🚗');
-      console.log('══════════════════════════════════\n');
-    }
- 
-    if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const reason     = lastDisconnect?.error?.message || 'unknown';
- 
-      console.log(`❌ WA closed — code: ${statusCode}, reason: ${reason}`);
- 
-      if (statusCode === DisconnectReason.loggedOut) {
-        console.log('🔴 LOGGED OUT. Delete .wa_auth folder and restart to re-scan QR.');
-        return; // don't reconnect
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+
+    // ✅ MUST use fetchLatestBaileysVersion — hardcoded versions cause 405 errors
+    const { version } = await fetchLatestBaileysVersion();
+    console.log(`📱 Baileys starting with WA v${version.join('.')}`);
+
+    sock = makeWASocket({
+      version,
+      auth:  state,
+      printQRInTerminal: false, // we render it ourselves below
+      logger: pino({ level: 'silent' }),
+      // ✅ Proper v7 browser fingerprint — avoids 405 Connection Failure
+      browser: Browsers.appropriate('Chrome'),
+      connectTimeoutMs:    60_000,
+      keepAliveIntervalMs: 25_000,
+      retryRequestDelayMs: 2_000,
+      maxMsgRetryCount: 5,
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+      if (qr) {
+        console.log('\n📱 ══════════════════════════════════════════════');
+        console.log('    SCAN THIS QR CODE IN WHATSAPP NOW');
+        console.log('    WhatsApp → Settings → Linked Devices');
+        console.log('    → Link a Device → scan the code below');
+        console.log('════════════════════════════════════════════════\n');
+        // Raw string fallback for Railway / narrow terminals
+        console.log('📱 QR RAW STRING (copy to https://webqr.com if blocks look distorted):');
+        console.log(qr);
+        console.log('\n');
+        qrcode.generate(qr, { small: true });
+        console.log('\n════════════════════════════════════════════════');
+        console.log('    ☝️  Scan the QR above within 60 seconds');
+        console.log('════════════════════════════════════════════════\n');
       }
- 
-      if (statusCode === 515 || statusCode === 405) {
-        // Stream/connection error — clear bad auth and restart fresh
-        console.log(`⚠️  Error ${statusCode} — clearing auth and restarting in 8s...`);
+
+      if (connection === 'open') {
+        console.log('\n✅ ══════════════════════════════════');
+        console.log('   WHATSAPP CONNECTED!');
+        console.log('   CampusMove bot is LIVE 🚗');
+        console.log('══════════════════════════════════\n');
+      }
+
+      if (connection === 'close') {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const reason     = lastDisconnect?.error?.message || 'unknown';
+
+        console.log(`❌ WA closed — code: ${statusCode}, reason: ${reason}`);
+
+        if (statusCode === DisconnectReason.loggedOut) {
+          console.log('🔴 LOGGED OUT. Delete .wa_auth folder and restart to re-scan QR.');
+          return;
+        }
+
+        if (statusCode === 515 || statusCode === 405) {
+          console.log(`⚠️  Error ${statusCode} — clearing auth and restarting in 8s...`);
+          try {
+            fs.rmSync(authDir, { recursive: true, force: true });
+            fs.mkdirSync(authDir, { recursive: true });
+          } catch (e) {}
+          setTimeout(startWhatsApp, 8000);
+          return;
+        }
+
+        const delay = statusCode === 408 ? 10000 : 5000;
+        console.log(`🔄 Reconnecting in ${delay / 1000}s...`);
+        setTimeout(startWhatsApp, delay);
+      }
+    });
+
+    // ── INCOMING MESSAGE LISTENER ──────────────────
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+
+      for (const msg of messages) {
+        if (msg.key.fromMe) continue;
+        if (!msg.message)   continue;
+
+        const jid = msg.key.remoteJid;
+        if (!jid || jid.endsWith('@g.us')) continue;
+
+        const phone = jid.split('@')[0];
+        const body  = (
+          msg.message?.conversation ||
+          msg.message?.extendedTextMessage?.text ||
+          msg.message?.imageMessage?.caption ||
+          ''
+        ).trim();
+
+        if (!body) continue;
+        console.log(`📨 [${phone}]: ${body}`);
+
         try {
-          fs.rmSync(authDir, { recursive: true, force: true });
-          fs.mkdirSync(authDir, { recursive: true });
-        } catch (e) {}
-        setTimeout(startWhatsApp, 8000);
-        return;
+          await handleIncoming(phone, body);
+        } catch (err) {
+          console.error('❌ Message error:', err);
+          await sendMsg(phone, '❌ Something went wrong.\n\nType *MENU* to restart.').catch(() => {});
+        }
       }
+    });
 
-      // Any other disconnect — reconnect after delay
-      const delay = statusCode === 408 ? 10000 : 5000;
-      console.log(`🔄 Reconnecting in ${delay/1000}s...`);
-      setTimeout(startWhatsApp, delay);
-    }
-  });
- 
-  // ── INCOMING MESSAGE LISTENER ──────────────────
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-
-    for (const msg of messages) {
-      if (msg.key.fromMe) continue;   // ignore messages the bot sent
-      if (!msg.message)   continue;
-
-      const jid = msg.key.remoteJid;
-      if (!jid || jid.endsWith('@g.us')) continue; // skip group chats
-
-      const phone = jid.split('@')[0]; // bare number, no + prefix
-      const body  = (
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
-        ''
-      ).trim();
-
-      if (!body) continue;
-      console.log(`📨 [${phone}]: ${body}`);
-
-      try {
-        await handleIncoming(phone, body);
-      } catch (err) {
-        console.error('❌ Message error:', err);
-        await sendMsg(phone, '❌ Something went wrong.\n\nType *MENU* to restart.').catch(() => {});
-      }
-    }
-  });
-}
-  catch (criticalError){
-    console.error("❌ CRITICAL EXCEPTION DURING STARTUP:");
+  } catch (criticalError) {
+    console.error('❌ CRITICAL EXCEPTION DURING STARTUP:');
     console.error(criticalError.message);
     console.error(criticalError.stack);
-    console.log("Holding container open for debugging logs...");
+    console.log('Holding container open for debugging logs...');
   }
 }
 
