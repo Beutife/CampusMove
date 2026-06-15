@@ -29,7 +29,7 @@ require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 process.stdout._handle && process.stdout._handle.setBlocking && process.stdout._handle.setBlocking(true);
 
 // ─────────────────────────────────────────────
-// FIREBASE INIT
+// FIREBASE INIT (lazy — deferred until first use)
 // ─────────────────────────────────────────────
 function normalizePrivateKey(key) {
   if (!key) return key;
@@ -37,7 +37,7 @@ function normalizePrivateKey(key) {
   return key.replace(/\\n/g, '\n');
 }
 
-function getFirebaseCredential() {
+function buildFirebaseCredential() {
   const p = path.join(__dirname, '..', 'serviceAccountKey.json');
   if (fs.existsSync(p)) {
     const data = JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -45,19 +45,43 @@ function getFirebaseCredential() {
   }
   const { FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY } = process.env;
   if (!FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) {
-    throw new Error('Missing Firebase credentials.');
+    throw new Error('Missing Firebase credentials (FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY).');
   }
   return admin.credential.cert({
-    projectId:   process.env.FIREBASE_PROJECT_ID,
-    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-    privateKey:  normalizePrivateKey(process.env.FIREBASE_PRIVATE_KEY),
+    projectId:   FIREBASE_PROJECT_ID,
+    clientEmail: FIREBASE_CLIENT_EMAIL,
+    privateKey:  normalizePrivateKey(FIREBASE_PRIVATE_KEY),
   });
 }
 
-if (!admin.apps.length) {
-  admin.initializeApp({ credential: getFirebaseCredential() });
+// Lazily-initialised Firestore instance — null until first successful init.
+let _db = null;
+
+function getDb() {
+  if (_db) return _db;
+  try {
+    if (!admin.apps.length) {
+      admin.initializeApp({ credential: buildFirebaseCredential() });
+    }
+    _db = admin.firestore();
+    console.log('✅ Firebase initialised successfully.');
+    return _db;
+  } catch (err) {
+    console.warn('⚠️  Firebase not available:', err.message);
+    console.warn('   Database operations will fail until credentials are provided.');
+    return null;
+  }
 }
-const db = admin.firestore();
+
+// Convenience: returns Firestore or throws a clear error (caught by each handler's try-catch).
+function db() {
+  const instance = getDb();
+  if (!instance) throw new Error('Firebase is not initialised — check FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY.');
+  return instance;
+}
+
+// Attempt a non-fatal early init so any credential problems surface in logs at startup.
+getDb();
 
 // ─────────────────────────────────────────────
 // EXPRESS SETUP
@@ -232,7 +256,7 @@ function isAdmin(phone) {
 // ─────────────────────────────────────────────
 async function getSession(phone) {
   const clean = stripPlus(phone);
-  const doc = await db.collection('sessions').doc(clean).get();
+  const doc = await db().collection('sessions').doc(clean).get();
   if (doc.exists) return doc.data();
   return { phone: clean, state: 'HOME', tempData: {} };
 }
@@ -241,12 +265,12 @@ async function saveSession(phone, session) {
   const clean = stripPlus(phone);
   session.phone = clean;
   session.updatedAt = Date.now();
-  await db.collection('sessions').doc(clean).set(session);
+  await db().collection('sessions').doc(clean).set(session);
 }
 
 async function clearSession(phone) {
   const clean = stripPlus(phone);
-  await db.collection('sessions').doc(clean).set({
+  await db().collection('sessions').doc(clean).set({
     phone: clean,
     state: 'HOME',
     tempData: {},
@@ -352,7 +376,7 @@ async function handleAdminCommand(adminPhone, cmd) {
     await sendMsg(adminPhone, `✅ Message sent to ${target}`).catch(() => {});
 
   } else if (action === 'STATUS' && parts[1]) {
-    const snap = await db.collection('bookings').doc(parts[1]).get();
+    const snap = await db().collection('bookings').doc(parts[1]).get();
     if (!snap.exists) {
       await sendMsg(adminPhone, 'Booking not found.').catch(() => {});
       return;
@@ -365,8 +389,8 @@ async function handleAdminCommand(adminPhone, cmd) {
     await sendMsg(adminPhone, `✅ Session reset for ${parts[1]}`).catch(() => {});
 
   } else if (action === 'REFUND' && parts[1]) {
-    await db.collection('bookings').doc(parts[1]).update({ status: 'refunded', refunded_at: Date.now() });
-    const snap = await db.collection('bookings').doc(parts[1]).get();
+    await db().collection('bookings').doc(parts[1]).update({ status: 'refunded', refunded_at: Date.now() });
+    const snap = await db().collection('bookings').doc(parts[1]).get();
     const phone = snap.data()?.phone;
     if (phone) await sendMsg(phone, `✅ Your booking ${parts[1]} has been refunded.\n\nType MENU to book another ride.`).catch(() => {});
     await sendMsg(adminPhone, `✅ Refund issued for ${parts[1]}`).catch(() => {});
@@ -540,7 +564,7 @@ async function handleState(phone, input, session) {
 
   if (state === 'WAITING_DRIVER_ACCEPT') {
     const bookingId = session.tempData.bookingId;
-    const snap = await db.collection('bookings').doc(bookingId).get();
+    const snap = await db().collection('bookings').doc(bookingId).get();
     if (!snap.exists) { await clearSession(phone); return 'Booking not found. Type MENU to start over.'; }
     const bk = snap.data();
 
@@ -558,7 +582,7 @@ async function handleState(phone, input, session) {
       return `⌛ *Request timed out.*\n\nNo response from the driver.\n\nType MENU to search again — we'll find you another ride.`;
     }
     if (inp.toLowerCase() === 'cancel') {
-      await db.collection('bookings').doc(bookingId).update({ status: 'cancelled_by_student', cancelled_at: Date.now() });
+      await db().collection('bookings').doc(bookingId).update({ status: 'cancelled_by_student', cancelled_at: Date.now() });
       const driverPhone = session.tempData.selectedRide?.driver_phone;
       if (driverPhone) await sendMsg(driverPhone, `ℹ️ The student cancelled booking *${bookingId}* before you responded.`).catch(() => {});
       await clearSession(phone);
@@ -578,7 +602,7 @@ async function handleState(phone, input, session) {
     const lower = inp.toLowerCase();
     if (lower === 'arrived' || lower === 'yes') {
       const bookingId = session.tempData.bookingId;
-      await db.collection('bookings').doc(bookingId).update({ status: 'completed', completed_at: Date.now() });
+      await db().collection('bookings').doc(bookingId).update({ status: 'completed', completed_at: Date.now() });
       session.state = 'RATE_RIDE_LIST';
       session.tempData.rateBookingId = bookingId;
       await saveSession(phone, session);
@@ -594,7 +618,7 @@ async function handleState(phone, input, session) {
 
   if (state === 'REPORT_ISSUE') {
     const bookingId = session.tempData.bookingId || 'unknown';
-    await db.collection('issues').add({
+    await db().collection('issues').add({
       phone,
       bookingId,
       issue: inp,
@@ -613,7 +637,7 @@ async function handleState(phone, input, session) {
   if (state === 'OFFER_RIDE_CHECK') {
     const isYes = ['a','yes'].includes(inp.toLowerCase());
     if (isYes) {
-      const userDoc = await db.collection('drivers').doc(stripPlus(phone)).get();
+      const userDoc = await db().collection('drivers').doc(stripPlus(phone)).get();
       if (userDoc.exists) {
         const driver = userDoc.data();
         session.tempData.driver_name   = driver.name;
@@ -646,7 +670,7 @@ async function handleState(phone, input, session) {
     session.state = 'OFFER_RIDE_REGISTER_PROVIDER';
     await saveSession(phone, session);
 
-    const snap = await db.collection('providers').where('active', '==', true).get();
+    const snap = await db().collection('providers').where('active', '==', true).get();
     let msg = `🏢 *Which company do you drive for?*\n\n`;
     const providers = [];
     snap.forEach((doc, i) => {
@@ -672,7 +696,7 @@ async function handleState(phone, input, session) {
       session.tempData.provider_name = providers[idx].name;
     }
 
-    await db.collection('drivers').doc(stripPlus(phone)).set({
+    await db().collection('drivers').doc(stripPlus(phone)).set({
       phone:         stripPlus(phone),
       name:          session.tempData.driver_name,
       vehicle_type:  session.tempData.vehicle_type,
@@ -757,10 +781,10 @@ async function handleState(phone, input, session) {
       created_at:      Date.now(),
     };
 
-    const ref = await db.collection('rides').add(ride);
+    const ref = await db().collection('rides').add(ride);
     await clearSession(phone);
 
-    await db.collection('drivers').doc(stripPlus(phone)).update({
+    await db().collection('drivers').doc(stripPlus(phone)).update({
       total_rides: admin.firestore.FieldValue.increment(1),
     }).catch(() => {});
 
@@ -792,7 +816,7 @@ async function handleState(phone, input, session) {
     const driverName = session.tempData.driver_name || 'Your driver';
 
     if (accept) {
-      await db.collection('bookings').doc(bookingId).update({
+      await db().collection('bookings').doc(bookingId).update({
         status: 'accepted',
         accepted_at: Date.now(),
         driver_name: driverName,
@@ -811,7 +835,7 @@ async function handleState(phone, input, session) {
     }
 
     if (reject) {
-      await db.collection('bookings').doc(bookingId).update({
+      await db().collection('bookings').doc(bookingId).update({
         status: 'rejected',
         rejected_at: Date.now(),
       });
@@ -827,13 +851,13 @@ async function handleState(phone, input, session) {
     if (![1,2,3,4,5].includes(rating)) return 'Please reply 1, 2, 3, 4, or 5.';
 
     const bookingId = session.tempData.rateBookingId;
-    await db.collection('bookings').doc(bookingId).update({
+    await db().collection('bookings').doc(bookingId).update({
       rider_rating: rating,
       rated_at:     Date.now(),
       status:       'completed',
     });
 
-    const bSnap = await db.collection('bookings').doc(bookingId).get();
+    const bSnap = await db().collection('bookings').doc(bookingId).get();
     const dPhone = bSnap.data()?.driver_phone;
     if (dPhone) await updateDriverRating(dPhone, rating);
 
@@ -849,14 +873,14 @@ async function handleState(phone, input, session) {
 // DRIVER COMMANDS
 // ─────────────────────────────────────────────
 async function handleDriverClose(phone, bookingId) {
-  const snap = await db.collection('bookings').doc(bookingId).get();
+  const snap = await db().collection('bookings').doc(bookingId).get();
   if (!snap.exists) {
     await sendMsg(phone, `Booking ${bookingId} not found.`).catch(() => {});
     return;
   }
   const booking = snap.data();
 
-  const driverSnap = await db.collection('drivers').doc(stripPlus(phone)).get();
+  const driverSnap = await db().collection('drivers').doc(stripPlus(phone)).get();
   const driverName = driverSnap.exists ? driverSnap.data().name : 'Your driver';
 
   await sendMsg(booking.phone, `🚗 *Driver is nearby!*\n\n*${driverName}* is approaching your pickup point.\n\nPlease make your way outside now.\n\nBooking: \`${bookingId}\``).catch(() => {});
@@ -864,7 +888,7 @@ async function handleDriverClose(phone, bookingId) {
 }
 
 async function handleDriverCancelBooking(phone, bookingId) {
-  const snap = await db.collection('bookings').doc(bookingId).get();
+  const snap = await db().collection('bookings').doc(bookingId).get();
   if (!snap.exists) {
     await sendMsg(phone, `Booking ${bookingId} not found.`).catch(() => {});
     return;
@@ -876,7 +900,7 @@ async function handleDriverCancelBooking(phone, bookingId) {
     return;
   }
 
-  await db.collection('bookings').doc(bookingId).update({
+  await db().collection('bookings').doc(bookingId).update({
     status: 'cancelled_by_driver',
     cancelled_at: Date.now(),
   });
@@ -899,13 +923,13 @@ function scheduleBookingTimeout(bookingId, studentPhone, driverPhone) {
 
   setTimeout(async () => {
     try {
-      const snap = await db.collection('bookings').doc(bookingId).get();
+      const snap = await db().collection('bookings').doc(bookingId).get();
       if (!snap.exists) return;
       const booking = snap.data();
 
       if (booking.status !== 'pending') return;
 
-      await db.collection('bookings').doc(bookingId).update({
+      await db().collection('bookings').doc(bookingId).update({
         status: 'expired',
         expired_at: Date.now(),
       });
@@ -927,7 +951,7 @@ async function startRideTracking(bookingId, studentPhone) {
 
   setTimeout(async () => {
     try {
-      const snap = await db.collection('bookings').doc(bookingId).get();
+      const snap = await db().collection('bookings').doc(bookingId).get();
       if (!snap.exists) return;
       const b = snap.data();
       if (['completed','cancelled_by_driver','refunded'].includes(b.status)) return;
@@ -952,7 +976,7 @@ async function startRideTracking(bookingId, studentPhone) {
 
 async function searchRides(from, to, _when) {
   try {
-    const snap = await db.collection('rides').where('status', '==', 'available').get();
+    const snap = await db().collection('rides').where('status', '==', 'available').get();
     const fq   = norm(from);
     const tq   = norm(to);
     const results = [];
@@ -985,7 +1009,7 @@ async function createBooking(phone, tempData) {
     status:      'pending',
     created_at:  Date.now(),
   };
-  const ref = await db.collection('bookings').add(booking);
+  const ref = await db().collection('bookings').add(booking);
   return { id: ref.id, ...booking };
 }
 
@@ -999,7 +1023,7 @@ async function batchInQuery(collection, field, values, ...conditions) {
   const results = [];
   for (let i = 0; i < values.length; i += CHUNK) {
     const chunk = values.slice(i, i + CHUNK);
-    let q = db.collection(collection).where(field, 'in', chunk);
+    let q = db().collection(collection).where(field, 'in', chunk);
     for (const [f, op, v] of conditions) q = q.where(f, op, v);
     const snap = await q.get();
     snap.forEach(doc => results.push({ id: doc.id, ...doc.data() }));
@@ -1009,7 +1033,7 @@ async function batchInQuery(collection, field, values, ...conditions) {
 
 async function showPendingRequests(phone, session) {
   try {
-    const ridesSnap = await db.collection('rides')
+    const ridesSnap = await db().collection('rides')
       .where('driver_phone', '==', stripPlus(phone)).get();
 
     const rideIds = ridesSnap.docs.map(d => d.id);
@@ -1033,7 +1057,7 @@ async function showPendingRequests(phone, session) {
     });
     msg += `_Reply with number to review_`;
 
-    const driverSnap = await db.collection('drivers').doc(stripPlus(phone)).get();
+    const driverSnap = await db().collection('drivers').doc(stripPlus(phone)).get();
     if (driverSnap.exists) session.tempData.driver_name = driverSnap.data().name;
 
     session.tempData.pendingBookings = pending;
@@ -1048,7 +1072,7 @@ async function showPendingRequests(phone, session) {
 
 async function showMyBookings(phone) {
   try {
-    const snap = await db.collection('bookings')
+    const snap = await db().collection('bookings')
       .where('phone', '==', stripPlus(phone))
       .orderBy('created_at', 'desc')
       .limit(5).get();
@@ -1071,8 +1095,8 @@ async function showMyBookings(phone) {
 async function showProfile(phone) {
   try {
     const [driverSnap, bookingsSnap] = await Promise.all([
-      db.collection('drivers').doc(stripPlus(phone)).get(),
-      db.collection('bookings').where('phone', '==', stripPlus(phone)).get(),
+      db().collection('drivers').doc(stripPlus(phone)).get(),
+      db().collection('bookings').where('phone', '==', stripPlus(phone)).get(),
     ]);
 
     let msg = `👤 *Your Profile*\n\n📞 ${phone}\n`;
@@ -1098,7 +1122,7 @@ async function showProfile(phone) {
 
 async function showRidesToRate(phone, session) {
   try {
-    const snap = await db.collection('bookings')
+    const snap = await db().collection('bookings')
       .where('phone', '==', stripPlus(phone))
       .where('status', '==', 'confirmed')
       .orderBy('created_at', 'desc')
@@ -1123,9 +1147,9 @@ async function showRidesToRate(phone, session) {
 }
 
 async function updateDriverRating(driverPhone, newRating) {
-  const ref = db.collection('drivers').doc(stripPlus(driverPhone));
+  const ref = db().collection('drivers').doc(stripPlus(driverPhone));
   try {
-    await db.runTransaction(async tx => {
+    await db().runTransaction(async tx => {
       const snap = await tx.get(ref);
       if (!snap.exists) return;
       const d = snap.data();
@@ -1178,7 +1202,7 @@ async function handlePaystackWebhook(req, res) {
       const { reference, amount, channel, paid_at } = event.data;
       const amountNaira = amount / 100;
 
-      const snap = await db.collection('bookings').doc(reference).get();
+      const snap = await db().collection('bookings').doc(reference).get();
       if (!snap.exists) return res.sendStatus(200);
 
       const booking = snap.data();
@@ -1190,10 +1214,10 @@ async function handlePaystackWebhook(req, res) {
         return res.sendStatus(200);
       }
 
-      const rideSnap = booking.ride_id ? await db.collection('rides').doc(booking.ride_id).get() : null;
+      const rideSnap = booking.ride_id ? await db().collection('rides').doc(booking.ride_id).get() : null;
       const ride     = rideSnap?.exists ? rideSnap.data() : {};
 
-      await db.collection('bookings').doc(reference).update({
+      await db().collection('bookings').doc(reference).update({
         status:            'confirmed',
         paid_at:           Date.now(),
         payment_method:    channel || 'paystack',
@@ -1204,8 +1228,8 @@ async function handlePaystackWebhook(req, res) {
       await storeReceipt(reference, reference, amountNaira, event.data).catch(() => {});
 
       if (booking.ride_id && booking.seats > 0) {
-        await db.runTransaction(async tx => {
-          const rRef  = db.collection('rides').doc(booking.ride_id);
+        await db().runTransaction(async tx => {
+          const rRef  = db().collection('rides').doc(booking.ride_id);
           const rSnap = await tx.get(rRef);
           if (!rSnap.exists) return;
           const cur = Number(rSnap.data().seats_available || 0);
@@ -1240,7 +1264,7 @@ async function handlePaystackWebhook(req, res) {
 app.post('/api/admin/add-ride', async (req, res) => {
   const { driver_name, driver_phone, provider_id, provider_name, vehicle_type, from, to, departure_time, seats, cost_per_seat } = req.body;
   try {
-    const ref = await db.collection('rides').add({
+    const ref = await db().collection('rides').add({
       driver_name,
       driver_phone: stripPlus(driver_phone),
       provider_id:   provider_id   || null,
@@ -1261,7 +1285,7 @@ app.post('/api/admin/add-ride', async (req, res) => {
 app.post('/api/admin/add-provider', async (req, res) => {
   const { id, name, type, contact_phone } = req.body;
   try {
-    await db.collection('providers').doc(id).set({ name, type, contact_phone, active: true, created_at: Date.now() });
+    await db().collection('providers').doc(id).set({ name, type, contact_phone, active: true, created_at: Date.now() });
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1271,10 +1295,10 @@ app.post('/api/admin/add-provider', async (req, res) => {
 app.get('/api/admin/stats', async (_req, res) => {
   try {
     const [rides, bookings, users, drivers] = await Promise.all([
-      db.collection('rides').get(),
-      db.collection('bookings').get(),
-      db.collection('sessions').get(),
-      db.collection('drivers').get(),
+      db().collection('rides').get(),
+      db().collection('bookings').get(),
+      db().collection('sessions').get(),
+      db().collection('drivers').get(),
     ]);
 
     const byStatus = {};
@@ -1301,22 +1325,19 @@ app.get('/api/admin/stats', async (_req, res) => {
 // ─────────────────────────────────────────────
 // START SERVER & BOT
 // ─────────────────────────────────────────────
-if (process.env.NODE_ENV !== 'production') {
-  const PORT = process.env.PORT || 3000;
-  
-  // Start bot
-  startWhatsApp().catch(err => {
-    console.error('❌ Failed to start WhatsApp bot:', err);
-    process.exit(1);
-  });
+const PORT = process.env.PORT || 3000;
 
-  // Start server
-  app.listen(PORT, () => {
-    console.log(`\n🚗 CampusMove Bot v2.0 running on :${PORT}\n`
-      + `   Paystack: POST /api/paystack/webhook\n`
-      + `   Stats:    GET  /api/admin/stats\n`
-      + `\n   Scan QR above to connect WhatsApp\n`);
-  });
-}
+// Start WhatsApp bot (non-fatal — server still starts if this fails)
+startWhatsApp().catch(err => {
+  console.error('❌ Failed to start WhatsApp bot:', err);
+});
+
+// Start HTTP server
+app.listen(PORT, () => {
+  console.log(`\n🚗 CampusMove Bot v2.0 running on :${PORT}\n`
+    + `   Paystack: POST /api/paystack/webhook\n`
+    + `   Stats:    GET  /api/admin/stats\n`
+    + `\n   Scan QR above to connect WhatsApp\n`);
+});
 
 module.exports = app;
