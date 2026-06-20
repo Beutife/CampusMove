@@ -4,7 +4,8 @@
   "main": "telegram_bot",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node bot/telegram_bot.js"
+    "start": "node bot/telegram_bot.js",
+    "whatsapp": "node server/index.js"
   },
   "engines": {
     "node": ">=20.0.0"
