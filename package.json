@@ -1,10 +1,10 @@
 {
   "name": "campusmove",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "telegram_bot",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node api/telegram_bot.js"
+    "start": "node bot/telegram_bot.js"
   },
   "engines": {
     "node": ">=20.0.0"
