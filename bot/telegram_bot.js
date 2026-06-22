@@ -485,26 +485,44 @@ async function handleState(chatId, input, session) {
 
 async function viewAvailableRequests(chatId, session) {
   try {
-    // Check if driver registered
+    console.log(`\n🔍 [DRIVER ${chatId}] Fetching available requests...`);
+
     const driverSnap = await db.collection('drivers').doc(String(chatId)).get();
+    
     if (!driverSnap.exists) {
+      console.log(`   ℹ️ Driver not registered`);
       session.state = 'DRIVER_REGISTER_NAME';
       session.tempData = {};
       await saveSession(chatId, session);
-      return `🚗 *Register as Driver*\n\nWhat's your name?\n_(Students will see this)_`;
+      return `🚗 *Register as Driver*\n\nWhat's your name?`;
     }
 
-    // Get open requests
-    const snap = await db.collection('booking_requests')
-      .where('status', '==', 'open')
-      .orderBy('created_at', 'desc')
-      .limit(20)
-      .get();
+    const driverName = driverSnap.data().name;
+    console.log(`   ✅ Driver: ${driverName}`);
+
+    let snap;
+    try {
+      console.log(`   🔄 Trying: booking_requests...`);
+      snap = await db.collection('booking_requests')
+        .where('status', '==', 'open')
+        .orderBy('created_at', 'desc')
+        .limit(20)
+        .get();
+    } catch (error1) {
+      console.log(`   ⚠️ Trying: bookings (V2)...`);
+      snap = await db.collection('bookings')
+        .where('status', '==', 'pending')
+        .orderBy('created_at', 'desc')
+        .limit(20)
+        .get();
+    }
+
+    console.log(`   📋 Found: ${snap.size}`);
 
     if (snap.empty) {
       session.state = 'MENU_CHOICE';
       await saveSession(chatId, session);
-      return `😔 No available requests right now.\n\nCheck back soon!\n\nType MENU to continue.`;
+      return `😔 No available requests right now.\n\nType MENU to continue.`;
     }
 
     const requests = [];
@@ -512,23 +530,31 @@ async function viewAvailableRequests(chatId, session) {
 
     snap.forEach((doc, i) => {
       const r = doc.data();
+      const from = r.from || r.from_location || 'Pickup';
+      const to = r.to || r.to_location || 'Dropoff';
+      const when = r.when || 'ASAP';
+      const seats = r.seats || 1;
+      const budget = r.budget || 0;
+      
       requests.push({ id: doc.id, ...r });
       
-      msg += `*${i + 1}. ${r.from} → ${r.to}*\n`;
-      msg += `   🪑 ${r.seats} seat(s) | ⏰ ${r.when}\n`;
-      msg += `   Budget: ${r.budget > 0 ? '₦' + r.budget + '/seat' : 'Flexible'}\n\n`;
+      msg += `*${i + 1}. ${from} → ${to}*\n`;
+      msg += `   🪑 ${seats} seat(s) | ⏰ ${when}\n`;
+      msg += `   Budget: ${budget > 0 ? '₦' + budget : 'Flexible'}\n\n`;
     });
 
-    msg += `_Reply with number to accept request_`;
+    msg += `_Reply with number to accept_`;
 
     session.tempData.availableRequests = requests;
     session.state = 'VIEW_AVAILABLE_REQUESTS';
     await saveSession(chatId, session);
+
+    console.log(`   ✅ Showing ${requests.length} requests`);
     return msg;
 
   } catch (err) {
-    console.error('View requests error:', err);
-    return 'Error loading requests. Type MENU to continue.';
+    console.error(`❌ Error:`, err.message);
+    return `❌ Error loading requests: ${err.message}\n\nType MENU to try again.`;
   }
 }
 
@@ -799,6 +825,22 @@ app.get('/api/admin/stats', async (_req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════════
 // TELEGRAM MESSAGE LISTENER
 // ═══════════════════════════════════════════════════════════════════════════════════
+
+// DIAGNOSTIC ENDPOINT
+app.get('/api/diagnose', async (req, res) => {
+  const diagnosis = { collections: {} };
+  
+  for (const coll of ['booking_requests', 'bookings', 'drivers', 'campusmove_wallet']) {
+    try {
+      const snap = await db.collection(coll).limit(1).get();
+      diagnosis.collections[coll] = { exists: true, docs: snap.size };
+    } catch {
+      diagnosis.collections[coll] = { exists: false };
+    }
+  }
+  
+  res.json(diagnosis);
+});
 
 bot.on('message', async (msg) => {
   try {
