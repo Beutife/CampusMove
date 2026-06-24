@@ -579,37 +579,48 @@ async function notifyAllDrivers(requestId, requestData) {
   }
 }
 
-async function showDriverEarnings(chatId) {
+async function showAvailableRides(chatId) {
   try {
+    // Only fetch requests that are open, newest first
     const snap = await db.collection('booking_requests')
-      .where('accepted_driver_chatId', '==', String(chatId))
-      .where('status', '==', 'completed')
+      .where('status', '==', 'open')
+      .orderBy('created_at', 'desc')
+      .limit(10)
       .get();
 
-    let totalEarnings = 0;
-    snap.forEach(doc => {
-      const r = doc.data();
-      totalEarnings += (r.accepted_price || 0) * (r.seats || 1);
-    });
-
-    let msg = `💰 *Your Earnings*\n\n`;
-    msg += `Completed rides: ${snap.size}\n`;
-    msg += `Total earned: ₦${totalEarnings}\n\n`;
-
-    if (totalEarnings > 0) {
-      msg += `✅ Ready to withdraw!\n`;
-      msg += `Contact support to set up payout.`;
-    } else {
-      msg += `Start accepting requests to earn money! 🚀`;
+    if (snap.empty) {
+      return await bot.sendMessage(chatId, "🚖 No active student requests right now. Check back soon!");
     }
 
-    return msg;
+    for (const doc of snap.docs) {
+      const ride = doc.data();
+      const rideId = doc.id;
 
+      const messageText = `🚗 *New Ride Request Available!*\n\n` +
+                          `📍 *From:* ${ride.from}\n` +
+                          `🏁 *To:* ${ride.to}\n` +
+                          `👥 *Seats needed:* ${ride.seats}\n` +
+                          `💰 *Student Budget:* ₦${ride.budget}`;
+
+      // Single configuration structure passing the specific Ride ID to the callback
+      const inlineKeyboard = {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '✅ Accept Ride', callback_data: `accept_${rideId}` }
+            ]
+          ]
+        }
+      };
+
+      await bot.sendMessage(chatId, messageText, inlineKeyboard);
+    }
   } catch (e) {
-    return 'Error loading earnings. Type MENU to continue.';
+    console.error("Error loading available rides:", e);
+    await bot.sendMessage(chatId, "⚠️ Error loading available rides.");
   }
 }
-
 // ═══════════════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════════════
@@ -842,6 +853,9 @@ app.get('/api/diagnose', async (req, res) => {
   res.json(diagnosis);
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════════
+// TELEGRAM MESSAGE LISTENER (Handles regular text messages & commands)
+// ═══════════════════════════════════════════════════════════════════════════════════
 bot.on('message', async (msg) => {
   try {
     const chatId = msg.chat.id;
@@ -851,6 +865,12 @@ bot.on('message', async (msg) => {
 
     console.log(`📨 ${chatId}: "${text}"`);
 
+    // If a driver types a command to view rides manually
+    if (text === '/availablerides' || text === '🚖 View Available Rides') {
+      return await showAvailableRides(chatId);
+    }
+
+    // Pass everything else to your existing state machine / session logic
     const session = await getSession(chatId);
     await handleIncoming(chatId, text, session);
 
@@ -858,6 +878,70 @@ bot.on('message', async (msg) => {
     console.error('Message handler error:', err);
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// TELEGRAM CALLBACK QUERY LISTENER (Handles button clicks exclusively)
+// ═══════════════════════════════════════════════════════════════════════════════════
+bot.on('callback_query', async (callbackQuery) => {
+  const driverChatId = callbackQuery.message.chat.id;
+  const data = callbackQuery.data; // e.g., "accept_4pZvAelQqrUowb6aaY3B"
+
+  if (data.startsWith('accept_')) {
+    const rideId = data.replace('accept_', '');
+    const rideRef = db.collection('booking_requests').doc(rideId);
+
+    try {
+      // Run an atomic Firestore transaction to prevent double booking
+      const result = await db.runTransaction(async (transaction) => {
+        const rideDoc = await transaction.get(rideRef);
+        
+        if (!rideDoc.exists) {
+          throw new Error("Ride does not exist.");
+        }
+
+        const rideData = rideDoc.data();
+
+        // Anti-competition check: If it's not open, another driver already took it!
+        if (rideData.status !== 'open') {
+          return { success: false, reason: 'taken' };
+        }
+
+        // Lock the ride to this specific driver immediately
+        transaction.update(rideRef, {
+          status: 'accepted',
+          accepted_driver_chatId: String(driverChatId),
+          accepted_at: Date.now()
+        });
+
+        return { success: true, rideData };
+      });
+
+      if (!result.success) {
+        // Answer the telegram popup immediately to inform the driver
+        return bot.answerCallbackQuery(callbackQuery.id, {
+          text: "❌ Too late! This ride has already been accepted by another driver.",
+          show_alert: true
+        });
+      }
+
+      // If successful: Tell the driver
+      await bot.answerCallbackQuery(callbackQuery.id, { text: "🎉 Ride successfully assigned to you!" });
+      await bot.sendMessage(driverChatId, `✅ You have accepted the ride from *${result.rideData.from}* to *${result.rideData.to}*.\n\nContacting the student...`, { parse_mode: 'Markdown' });
+
+      // Notify the student that a driver is on the way
+      const studentChatId = result.rideData.student_chatId;
+      if (studentChatId) {
+        await bot.sendMessage(studentChatId, `🚀 A driver has accepted your ride request from *${result.rideData.from}* to *${result.rideData.to}*! Get ready.`);
+      }
+
+    } catch (error) {
+      console.error("Transaction failure:", error);
+      bot.answerCallbackQuery(callbackQuery.id, { text: "⚠️ Error processing request." });
+    }
+  }
+});
+
+
 
 // ═══════════════════════════════════════════════════════════════════════════════════
 // START SERVER
