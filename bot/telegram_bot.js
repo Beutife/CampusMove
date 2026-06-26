@@ -91,6 +91,80 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 // ═══════════════════════════════════════════════════════════════════════════════════
+// PAYSTACK SPLIT PAYMENT FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+const axios = require('axios');
+
+// Create driver subaccount on Paystack
+async function createDriverSubaccount(driverName, bankCode, accountNumber, driverChatId) {
+  try {
+    console.log(`📝 Creating Paystack subaccount for ${driverName}...`);
+    
+    const response = await axios.post(
+      'https://api.paystack.co/subaccount',
+      {
+        business_name: `Driver: ${driverName} (${driverChatId})`,
+        settlement_bank: bankCode,       // e.g., "058" for GTBank
+        account_number: accountNumber,   // 10-digit NUBAN
+        percentage_charge: 10            // 10% to YOU, 90% to driver
+      },
+      {
+        headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` }
+      }
+    );
+
+    const subaccountCode = response.data.data.subaccount_code;
+    console.log(`✅ Subaccount created: ${subaccountCode}`);
+    
+    return subaccountCode;
+  } catch (error) {
+    console.error("❌ Subaccount creation failed:", error.response?.data || error.message);
+    throw error;
+  }
+}
+
+// Generate the payment link for a student
+async function generatePaymentLink(bookingId, studentEmail, totalAmountNGN, driverChatId) {
+  try {
+    console.log(`💳 Generating payment link for booking ${bookingId}...`);
+    
+    // Fetch driver's subaccount code
+    const driverDoc = await db.collection('drivers').doc(String(driverChatId)).get();
+    
+    if (!driverDoc.exists || !driverDoc.data().subaccount_code) {
+      throw new Error("Driver does not have a linked Paystack subaccount.");
+    }
+
+    const driverSubaccount = driverDoc.data().subaccount_code;
+
+    // Initialize payment on Paystack
+    const response = await axios.post(
+      'https://api.paystack.co/transaction/initialize',
+      {
+        email: studentEmail,
+        amount: totalAmountNGN * 100,  // Convert to Kobo
+        subaccount: driverSubaccount,
+        bearer: "subaccount",          // Driver pays the gateway fee
+        metadata: { booking_id: bookingId }
+      },
+      {
+        headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` }
+      }
+    );
+
+    const paymentUrl = response.data.data.authorization_url;
+    console.log(`✅ Payment link generated: ${paymentUrl}`);
+    
+    return paymentUrl;
+  } catch (error) {
+    console.error("❌ Payment link generation failed:", error.response?.data || error.message);
+    throw error;
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════════
 // EXPRESS SETUP
 // ═══════════════════════════════════════════════════════════════════════════════════
 
@@ -106,6 +180,7 @@ app.get('/', (_req, res) => res.json({
   model: 'Demand-Driven',
   payment: '10% commission to CampusMove, 90% to driver',
 }));
+
 
 // ═══════════════════════════════════════════════════════════════════════════════════
 // TELEGRAM BOT SETUP
@@ -386,12 +461,79 @@ async function handleState(chatId, input, session) {
   // DRIVER: SELECT RIDE
 
   if (state === 'DRIVER_REGISTER_NAME') {
-      const name = inp.trim();
-      if (name.length < 2) return 'Name too short.';
+    const name = inp.trim();
+    if (name.length < 2) return 'Name too short.';
+    
+    session.tempData.driverName = name;
+    session.state = 'DRIVER_REGISTER_BANK';
+    await saveSession(chatId, session);
+    
+    return `✅ Name saved!\n\n🏦 *Link Your Bank Account*\n\n` +
+      `Which bank?\n\n` +
+      `1️⃣ GTBank (058)\n` +
+      `2️⃣ Access Bank (044)\n` +
+      `3️⃣ FirstBank (011)\n` +
+      `4️⃣ UBA (033)\n` +
+      `5️⃣ Zenith (050)\n\n` +
+      `Reply 1-5 or type bank code`;
+  }
+
+if (state === 'DRIVER_REGISTER_BANK') {
+    const bankMap = {
+      '1': '058', '2': '044', '3': '011', '4': '033', '5': '050',
+      'gtbank': '058', 'access': '044', 'firstbank': '011', 'uba': '033', 'zenith': '050'
+    };
+    
+    const bankCode = bankMap[inp.toLowerCase()];
+    if (!bankCode) return 'Invalid bank. Reply 1-5 or bank code.';
+    
+    session.tempData.bankCode = bankCode;
+    session.state = 'DRIVER_REGISTER_ACCOUNT';
+    await saveSession(chatId, session);
+    
+    return `💳 *Enter Account Number*\n\n10-digit NUBAN account number:\n_(e.g. 1234567890)_`;
+  }
+
+if (state === 'DRIVER_REGISTER_ACCOUNT') {
+    const accountNumber = inp.replace(/\D/g, '');
+    
+    if (accountNumber.length !== 10) {
+      return 'Account number must be exactly 10 digits.';
+    }
+    
+    session.tempData.accountNumber = accountNumber;
+    session.state = 'DRIVER_REGISTER_CONFIRM';
+    await saveSession(chatId, session);
+    
+    return `✅ *Review Your Details*\n\n` +
+      `Name: ${session.tempData.driverName}\n` +
+      `Bank Code: ${session.tempData.bankCode}\n` +
+      `Account: ${accountNumber}\n\n` +
+      `A) Confirm\nB) Cancel`;
+  }
+
+if (state === 'DRIVER_REGISTER_CONFIRM') {
+    if (!['a', 'yes', 'confirm'].includes(inp.toLowerCase())) {
+      await clearSession(chatId);
+      return 'Cancelled. Type MENU.';
+    }
+    
+    try {
+      // Create subaccount on Paystack
+      const subaccountCode = await createDriverSubaccount(
+        session.tempData.driverName,
+        session.tempData.bankCode,
+        session.tempData.accountNumber,
+        chatId
+      );
       
+      // Save driver with subaccount code
       await db.collection('drivers').doc(String(chatId)).set({
         chatId: String(chatId),
-        name: name,
+        name: session.tempData.driverName,
+        bank_code: session.tempData.bankCode,
+        account_number: session.tempData.accountNumber,
+        subaccount_code: subaccountCode,  // ← THIS IS CRITICAL
         vehicle_type: 'Not set',
         rating: 0,
         total_rides: 0,
@@ -400,8 +542,14 @@ async function handleState(chatId, input, session) {
       });
       
       await clearSession(chatId);
-      return `✅ Registered as ${name}!\n\nType MENU to start!`;
+      return `🎉 *All Set!*\n\n✅ Registered as ${session.tempData.driverName}\n✅ Bank linked to Paystack\n\nYou'll get 90% of every ride payment automatically!\n\nType MENU to start accepting rides.`;
+      
+    } catch (error) {
+      console.error('Registration error:', error);
+      await clearSession(chatId);
+      return `❌ Error linking bank: ${error.message}\n\nTry again. Type MENU.`;
     }
+  }
 
     // DRIVER: SELECT RIDE
   if (state === 'DRIVER_SELECT_RIDE') {
@@ -473,7 +621,7 @@ async function handleState(chatId, input, session) {
           accepted_at_readable: formatDate(Date.now()),
         });
 
-        return { success: true };
+        return { success: true, rideData: rideDoc.data() };
       });
 
       if (!result.success) {
@@ -481,30 +629,54 @@ async function handleState(chatId, input, session) {
         return `❌ Too late! Another driver got it.\n\nType MENU.`;
       }
 
-      await sendMsg(studentChatId, 
-        `✅ *Driver Found!*\n\n` +
-        `Driver: *${driverName}*\n` +
-        `Price: ₦${session.tempData.pricePerSeat}/seat\n` +
-        `Total: ₦${totalPrice}\n\n` +
-        `Request: \`${requestId}\`\n\n` +
-        buildPaymentMessage(requestId, totalPrice)
-      ).catch(() => {});
+      // ✨ PAYSTACK INTEGRATION STARTS HERE
+      try {
+        const studentEmail = result.rideData.student_email || `student_${studentChatId}@campusmove.io`;
+        
+        // Generate the payment link
+        const paymentLink = await generatePaymentLink(
+          requestId,
+          studentEmail,
+          totalPrice,
+          chatId  // driver's chatId
+        );
+
+        // Send to student
+        await sendMsg(studentChatId, 
+          `✅ *Driver Found!*\n\n` +
+          `Driver: *${driverName}*\n` +
+          `Price: ₦${session.tempData.pricePerSeat}/seat\n` +
+          `Total: ₦${totalPrice}\n\n` +
+          `[💳 Pay Securely via Paystack](${paymentLink})\n\n` +
+          `Tap above to complete payment. Once done, driver gets your location.`
+        ).catch(() => {});
+
+        // Send to driver
+        await sendMsg(chatId,
+          `🎉 *Ride Accepted!*\n\n` +
+          `You'll earn: ₦${totalPrice}\n\n` +
+          `Payment link sent to student.\n` +
+          `Waiting for payment confirmation...`
+        ).catch(() => {});
+
+      } catch (payError) {
+        console.error('Payment link error:', payError);
+        await sendMsg(studentChatId, 
+          `⚠️ Ride assigned but payment link failed.\n\n` +
+          `Please contact support.`
+        ).catch(() => {});
+      }
 
       await clearSession(chatId);
       return `🎉 *Accepted!*\n\n` +
         `You'll earn: ₦${totalPrice}\n\n` +
-        `Student notified. Payment coming soon!\n\n` +
-        `Type MENU.`;
+        `Student notified. Waiting for payment...\n\nType MENU.`;
 
     } catch (err) {
       console.error('Transaction error:', err);
       return `❌ Error: ${err.message}\n\nType MENU.`;
     }
   }
-
-  await clearSession(chatId);
-  return `Error. Type *MENU*.`;
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════════
 // DRIVER FUNCTIONS
