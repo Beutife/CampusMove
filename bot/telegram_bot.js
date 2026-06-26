@@ -17,8 +17,13 @@ const express = require('express');
 const admin = require('firebase-admin');
 const TelegramBot = require('node-telegram-bot-api');
 const crypto = require('crypto');
+const axios = require('axios');
 
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+
+function getPaystackSecret() {
+  return process.env.PAYSTACK_SECRET_KEY || process.env.PAYSTACK_SECRET || '';
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════════
 // UTILITIES
@@ -41,10 +46,9 @@ function formatDate(timestamp) {
 
 // Verify Paystack signature
 function verifyPaystackSignature(body, signature) {
-  const hash = crypto
-    .createHmac('sha512', process.env.PAYSTACK_SECRET || '')
-    .update(body)
-    .digest('hex');
+  const secret = getPaystackSecret();
+  if (!secret || !signature) return false;
+  const hash = crypto.createHmac('sha512', secret).update(body).digest('hex');
   return hash === signature;
 }
 
@@ -91,75 +95,196 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 // ═══════════════════════════════════════════════════════════════════════════════════
-// PAYSTACK SPLIT PAYMENT FUNCTIONS
+// PAYSTACK — VALIDATION & DRIVER SUBACCOUNTS
 // ═══════════════════════════════════════════════════════════════════════════════════
 
-const axios = require('axios');
+const VALID_BANKS = {
+  '058': 'GTBank',
+  '044': 'Access Bank',
+  '011': 'FirstBank',
+  '033': 'UBA',
+  '050': 'Zenith Bank',
+  '035': 'Wema Bank',
+  '070': 'Fidelity Bank',
+  '076': 'Polaris Bank',
+  '068': 'Standard Chartered',
+};
 
-// Create driver subaccount on Paystack
+function validateBankCode(bankCode) {
+  if (VALID_BANKS[bankCode]) {
+    return { valid: true, name: VALID_BANKS[bankCode] };
+  }
+  return {
+    valid: false,
+    message: `Valid codes:\n${Object.entries(VALID_BANKS).map(([code, name]) => `${code} - ${name}`).join('\n')}`,
+  };
+}
+
+function validateAccountNumber(accountNumber) {
+  const cleaned = String(accountNumber).replace(/\D/g, '');
+  if (cleaned.length !== 10) {
+    return {
+      valid: false,
+      message: `Account number must be exactly 10 digits. You entered: ${cleaned.length} digits.`,
+    };
+  }
+  return { valid: true, cleaned };
+}
+
+function getPaystackErrorHint(errorMsg, bankCode, accountNumber) {
+  const msg = String(errorMsg).toLowerCase();
+
+  if (msg.includes('invalid account') || msg.includes('account number')) {
+    return `Account number may be wrong.\n\nCheck:\n- Exactly 10 digits\n- Correct for ${VALID_BANKS[bankCode] || 'your bank'}\n- You entered: ${accountNumber}`;
+  }
+  if (msg.includes('bank') || msg.includes('settlement')) {
+    return `Bank code invalid.\n\nUse: ${Object.entries(VALID_BANKS).map(([code, name]) => `${code}=${name}`).join(', ')}`;
+  }
+  if (msg.includes('authorization') || msg.includes('unauthorized')) {
+    return 'Paystack API auth failed. Check PAYSTACK_SECRET_KEY in .env.';
+  }
+  if (msg.includes('duplicate') || msg.includes('exists')) {
+    return 'This bank account may already be registered. Try another account or contact support.';
+  }
+  return errorMsg;
+}
+
+async function validatePaystackCredentials() {
+  try {
+    console.log('\n🔐 Validating Paystack credentials...');
+    const secret = getPaystackSecret();
+    if (!secret) throw new Error('PAYSTACK_SECRET_KEY not set in .env');
+
+    const response = await axios.get('https://api.paystack.co/bank', {
+      headers: { Authorization: `Bearer ${secret}` },
+      timeout: 10000,
+    });
+
+    console.log('✅ Paystack credentials valid');
+    console.log(`   Retrieved ${response.data.data.length} banks`);
+    return true;
+  } catch (error) {
+    console.error('❌ PAYSTACK CREDENTIALS INVALID');
+    console.error('   Error:', error.response?.data?.message || error.message);
+    console.error('   Fix: Check PAYSTACK_SECRET_KEY in .env');
+    return false;
+  }
+}
+
 async function createDriverSubaccount(driverName, bankCode, accountNumber, driverChatId) {
   try {
-    console.log(`📝 Creating Paystack subaccount for ${driverName}...`);
-    
+    console.log(`\n📝 [DRIVER ${driverChatId}] Creating Paystack subaccount...`);
+    console.log(`   Name: ${driverName}`);
+    console.log(`   Bank: ${bankCode} (${VALID_BANKS[bankCode] || 'unknown'})`);
+    console.log(`   Account: ${accountNumber}`);
+
+    const bankValidation = validateBankCode(bankCode);
+    if (!bankValidation.valid) {
+      throw new Error(`Invalid bank code: ${bankCode}`);
+    }
+
+    const accountValidation = validateAccountNumber(accountNumber);
+    if (!accountValidation.valid) {
+      throw new Error(accountValidation.message);
+    }
+
     const response = await axios.post(
       'https://api.paystack.co/subaccount',
       {
         business_name: `Driver: ${driverName} (${driverChatId})`,
-        settlement_bank: bankCode,       // e.g., "058" for GTBank
-        account_number: accountNumber,   // 10-digit NUBAN
-        percentage_charge: 10            // 10% to YOU, 90% to driver
+        settlement_bank: bankCode,
+        account_number: accountValidation.cleaned,
+        percentage_charge: 10,
       },
       {
-        headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` }
+        headers: {
+          Authorization: `Bearer ${getPaystackSecret()}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 15000,
       }
     );
 
     const subaccountCode = response.data.data.subaccount_code;
     console.log(`✅ Subaccount created: ${subaccountCode}`);
-    
-    return subaccountCode;
+    return { success: true, subaccountCode };
   } catch (error) {
-    console.error("❌ Subaccount creation failed:", error.response?.data || error.message);
-    throw error;
+    const errorMsg = error.response?.data?.message || error.message;
+    console.error('❌ Subaccount creation failed:', errorMsg);
+    if (error.response?.data?.errors) {
+      console.error('   Details:', JSON.stringify(error.response.data.errors, null, 2));
+    }
+    return {
+      success: false,
+      error: errorMsg,
+      hint: getPaystackErrorHint(errorMsg, bankCode, accountNumber),
+    };
   }
 }
 
-// Generate the payment link for a student
+// Generate Paystack checkout link — reference MUST be bookingId for webhook lookup
 async function generatePaymentLink(bookingId, studentEmail, totalAmountNGN, driverChatId) {
   try {
     console.log(`💳 Generating payment link for booking ${bookingId}...`);
-    
-    // Fetch driver's subaccount code
+
     const driverDoc = await db.collection('drivers').doc(String(driverChatId)).get();
-    
     if (!driverDoc.exists || !driverDoc.data().subaccount_code) {
-      throw new Error("Driver does not have a linked Paystack subaccount.");
+      throw new Error('Driver does not have a linked Paystack subaccount. Re-register as driver.');
     }
 
     const driverSubaccount = driverDoc.data().subaccount_code;
+    const amountKobo = Math.round(Number(totalAmountNGN) * 100);
+    if (!amountKobo || amountKobo < 100) {
+      throw new Error('Invalid payment amount.');
+    }
 
-    // Initialize payment on Paystack
     const response = await axios.post(
       'https://api.paystack.co/transaction/initialize',
       {
         email: studentEmail,
-        amount: totalAmountNGN * 100,  // Convert to Kobo
+        amount: amountKobo,
+        reference: bookingId,
         subaccount: driverSubaccount,
-        bearer: "subaccount",          // Driver pays the gateway fee
-        metadata: { booking_id: bookingId }
+        bearer: 'account',
+        metadata: {
+          booking_id: bookingId,
+          driver_chatId: String(driverChatId),
+          custom_fields: [
+            { display_name: 'Booking ID', variable_name: 'booking_id', value: bookingId },
+          ],
+        },
       },
       {
-        headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` }
+        headers: {
+          Authorization: `Bearer ${getPaystackSecret()}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 15000,
       }
     );
 
+    if (!response.data.status) {
+      throw new Error(response.data.message || 'Paystack initialize failed');
+    }
+
     const paymentUrl = response.data.data.authorization_url;
+    const accessCode = response.data.data.access_code;
+
+    await db.collection('booking_requests').doc(bookingId).update({
+      payment_url: paymentUrl,
+      payment_access_code: accessCode,
+      payment_reference: bookingId,
+      payment_amount: totalAmountNGN,
+      payment_status: 'pending',
+      updated_at: Date.now(),
+    });
+
     console.log(`✅ Payment link generated: ${paymentUrl}`);
-    
     return paymentUrl;
   } catch (error) {
-    console.error("❌ Payment link generation failed:", error.response?.data || error.message);
-    throw error;
+    const msg = error.response?.data?.message || error.message;
+    console.error('❌ Payment link generation failed:', msg);
+    throw new Error(msg);
   }
 }
 
@@ -197,6 +322,13 @@ console.log('║                  Demand-Driven Model                      ║')
 console.log('║            10% Commission | 90% to Driver                 ║');
 console.log('╚════════════════════════════════════════════════════════════╝\n');
 console.log('✅ Firebase Connected');
+
+validatePaystackCredentials().then((ok) => {
+  if (!ok) {
+    console.error('\n⚠️  WARNING: Paystack credentials invalid. Driver registration and payments may fail.\n');
+  }
+});
+
 console.log('✅ Telegram Bot Connected');
 console.log(`📱 Bot: t.me/CampusMove_Bot`);
 console.log('🚀 Ready!\n');
@@ -458,98 +590,9 @@ async function handleState(chatId, input, session) {
     return `🙏 Thanks for rating!\n\nType MENU.`;
   }
 
-  // DRIVER: SELECT RIDE
-
-  if (state === 'DRIVER_REGISTER_NAME') {
-    const name = inp.trim();
-    if (name.length < 2) return 'Name too short.';
-    
-    session.tempData.driverName = name;
-    session.state = 'DRIVER_REGISTER_BANK';
-    await saveSession(chatId, session);
-    
-    return `✅ Name saved!\n\n🏦 *Link Your Bank Account*\n\n` +
-      `Which bank?\n\n` +
-      `1️⃣ GTBank (058)\n` +
-      `2️⃣ Access Bank (044)\n` +
-      `3️⃣ FirstBank (011)\n` +
-      `4️⃣ UBA (033)\n` +
-      `5️⃣ Zenith (050)\n\n` +
-      `Reply 1-5 or type bank code`;
-  }
-
-if (state === 'DRIVER_REGISTER_BANK') {
-    const bankMap = {
-      '1': '058', '2': '044', '3': '011', '4': '033', '5': '050',
-      'gtbank': '058', 'access': '044', 'firstbank': '011', 'uba': '033', 'zenith': '050'
-    };
-    
-    const bankCode = bankMap[inp.toLowerCase()];
-    if (!bankCode) return 'Invalid bank. Reply 1-5 or bank code.';
-    
-    session.tempData.bankCode = bankCode;
-    session.state = 'DRIVER_REGISTER_ACCOUNT';
-    await saveSession(chatId, session);
-    
-    return `💳 *Enter Account Number*\n\n10-digit NUBAN account number:\n_(e.g. 1234567890)_`;
-  }
-
-if (state === 'DRIVER_REGISTER_ACCOUNT') {
-    const accountNumber = inp.replace(/\D/g, '');
-    
-    if (accountNumber.length !== 10) {
-      return 'Account number must be exactly 10 digits.';
-    }
-    
-    session.tempData.accountNumber = accountNumber;
-    session.state = 'DRIVER_REGISTER_CONFIRM';
-    await saveSession(chatId, session);
-    
-    return `✅ *Review Your Details*\n\n` +
-      `Name: ${session.tempData.driverName}\n` +
-      `Bank Code: ${session.tempData.bankCode}\n` +
-      `Account: ${accountNumber}\n\n` +
-      `A) Confirm\nB) Cancel`;
-  }
-
-if (state === 'DRIVER_REGISTER_CONFIRM') {
-    if (!['a', 'yes', 'confirm'].includes(inp.toLowerCase())) {
-      await clearSession(chatId);
-      return 'Cancelled. Type MENU.';
-    }
-    
-    try {
-      // Create subaccount on Paystack
-      const subaccountCode = await createDriverSubaccount(
-        session.tempData.driverName,
-        session.tempData.bankCode,
-        session.tempData.accountNumber,
-        chatId
-      );
-      
-      // Save driver with subaccount code
-      await db.collection('drivers').doc(String(chatId)).set({
-        chatId: String(chatId),
-        name: session.tempData.driverName,
-        bank_code: session.tempData.bankCode,
-        account_number: session.tempData.accountNumber,
-        subaccount_code: subaccountCode,  // ← THIS IS CRITICAL
-        vehicle_type: 'Not set',
-        rating: 0,
-        total_rides: 0,
-        registered_at: Date.now(),
-        registered_at_readable: formatDate(Date.now()),
-      });
-      
-      await clearSession(chatId);
-      return `🎉 *All Set!*\n\n✅ Registered as ${session.tempData.driverName}\n✅ Bank linked to Paystack\n\nYou'll get 90% of every ride payment automatically!\n\nType MENU to start accepting rides.`;
-      
-    } catch (error) {
-      console.error('Registration error:', error);
-      await clearSession(chatId);
-      return `❌ Error linking bank: ${error.message}\n\nTry again. Type MENU.`;
-    }
-  }
+  // DRIVER REGISTRATION (Paystack bank linking)
+  const driverRegReply = await handleDriverRegistration(chatId, state, inp, session);
+  if (driverRegReply !== null) return driverRegReply;
 
     // DRIVER: SELECT RIDE
   if (state === 'DRIVER_SELECT_RIDE') {
@@ -603,6 +646,10 @@ if (state === 'DRIVER_REGISTER_CONFIRM') {
 
     const driverSnap = await db.collection('drivers').doc(String(chatId)).get();
     const driverName = driverSnap.exists ? driverSnap.data().name : 'Driver';
+
+    if (!driverSnap.exists || !driverSnap.data().subaccount_code) {
+      return `❌ Your Paystack bank account is not linked.\n\nType MENU → 2 to register again.`;
+    }
 
     try {
       const result = await db.runTransaction(async (transaction) => {
@@ -681,6 +728,117 @@ if (state === 'DRIVER_REGISTER_CONFIRM') {
   return 'Type *MENU* to go back to the main menu.';
 }
 
+async function handleDriverRegistration(chatId, state, input, session) {
+  const inp = input.trim();
+  const registerStates = [
+    'DRIVER_REGISTER_NAME',
+    'DRIVER_REGISTER_BANK',
+    'DRIVER_REGISTER_ACCOUNT',
+    'DRIVER_REGISTER_CONFIRM',
+  ];
+  if (!registerStates.includes(state)) return null;
+
+  if (state === 'DRIVER_REGISTER_NAME') {
+    if (inp.length < 2) return 'Name too short (min 2 chars).';
+    if (inp.length > 30) return 'Name too long (max 30 chars).';
+
+    session.tempData.driverName = inp;
+    session.state = 'DRIVER_REGISTER_BANK';
+    await saveSession(chatId, session);
+
+    return `✅ Name: *${inp}*\n\n🏦 *Which Bank?*\n\n` +
+      `1️⃣ GTBank (058)\n` +
+      `2️⃣ Access Bank (044)\n` +
+      `3️⃣ FirstBank (011)\n` +
+      `4️⃣ UBA (033)\n` +
+      `5️⃣ Zenith (050)\n` +
+      `6️⃣ Wema (035)\n` +
+      `7️⃣ Fidelity (070)\n` +
+      `8️⃣ Polaris (076)\n\n` +
+      `Reply 1-8 or bank code`;
+  }
+
+  if (state === 'DRIVER_REGISTER_BANK') {
+    const bankMap = {
+      '1': '058', '2': '044', '3': '011', '4': '033',
+      '5': '050', '6': '035', '7': '070', '8': '076',
+      gtbank: '058', access: '044', firstbank: '011', uba: '033', zenith: '050',
+    };
+
+    const bankCode = bankMap[inp.toLowerCase()] || inp;
+    const validation = validateBankCode(bankCode);
+    if (!validation.valid) {
+      return `❌ Invalid bank.\n\nReply 1-8 or valid code.\n\n${validation.message}`;
+    }
+
+    session.tempData.bankCode = bankCode;
+    session.state = 'DRIVER_REGISTER_ACCOUNT';
+    await saveSession(chatId, session);
+
+    return `✅ Bank: *${validation.name}* (${bankCode})\n\n💳 *Enter Account Number*\n\n10-digit NUBAN:\n_(e.g. 1234567890)_`;
+  }
+
+  if (state === 'DRIVER_REGISTER_ACCOUNT') {
+    const validation = validateAccountNumber(inp);
+    if (!validation.valid) return `❌ ${validation.message}`;
+
+    session.tempData.accountNumber = validation.cleaned;
+    session.state = 'DRIVER_REGISTER_CONFIRM';
+    await saveSession(chatId, session);
+
+    const bankName = VALID_BANKS[session.tempData.bankCode];
+    return `✅ *Review Your Details*\n\n` +
+      `Name: ${session.tempData.driverName}\n` +
+      `Bank: ${bankName}\n` +
+      `Account: ${validation.cleaned}\n\n` +
+      `A) Confirm & Link\nB) Cancel`;
+  }
+
+  if (state === 'DRIVER_REGISTER_CONFIRM') {
+    if (!['a', 'yes', 'confirm'].includes(inp.toLowerCase())) {
+      await clearSession(chatId);
+      return '❌ Cancelled.\n\nType MENU to restart.';
+    }
+
+    await sendMsg(chatId, '⏳ *Linking to Paystack...*\n\nThis takes 5-10 seconds...');
+
+    const result = await createDriverSubaccount(
+      session.tempData.driverName,
+      session.tempData.bankCode,
+      session.tempData.accountNumber,
+      String(chatId)
+    );
+
+    if (!result.success) {
+      await clearSession(chatId);
+      return `❌ *Bank Linking Failed*\n\n${result.hint}\n\nType MENU to try again.`;
+    }
+
+    await db.collection('drivers').doc(String(chatId)).set({
+      chatId: String(chatId),
+      name: session.tempData.driverName,
+      bank_code: session.tempData.bankCode,
+      account_number: session.tempData.accountNumber,
+      subaccount_code: result.subaccountCode,
+      vehicle_type: 'Not set',
+      rating: 0,
+      total_rides: 0,
+      earnings_balance: 0,
+      total_earnings: 0,
+      registered_at: Date.now(),
+      registered_at_readable: formatDate(Date.now()),
+      paystack_linked: true,
+      paystack_linked_at: Date.now(),
+    });
+
+    console.log(`✅ [DRIVER ${chatId}] Registered — subaccount: ${result.subaccountCode}`);
+    await clearSession(chatId);
+    return `🎉 *All Set!*\n\n✅ Registered as *${session.tempData.driverName}*\n✅ Bank linked to Paystack\n\n💰 You'll get 90% of every payment automatically!\n\n📍 Type MENU → 2 to accept rides.`;
+  }
+
+  return null;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════════
 // DRIVER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════════════
@@ -701,6 +859,13 @@ async function viewAvailableRequests(chatId, session) {
     }
 
     const driverName = driverSnap.data().name;
+    if (!driverSnap.data().subaccount_code) {
+      console.log(`   ⚠️ Driver missing Paystack subaccount`);
+      session.state = 'DRIVER_REGISTER_NAME';
+      session.tempData = { driverName };
+      await saveSession(chatId, session);
+      return `⚠️ *Paystack Not Linked*\n\nHi ${driverName}, your bank account needs to be linked before you can accept rides.\n\nWhat's your name? (re-enter to continue setup)`;
+    }
     console.log(`   ✅ Driver: ${driverName}`);
 
     // Get ALL open requests (NO INDEX NEEDED)
@@ -934,20 +1099,25 @@ async function handlePaystackWebhook(req, res) {
     const event = JSON.parse(body);
 
     if (event.event === 'charge.success') {
-      const { reference, amount } = event.data;
+      const { reference, amount, metadata } = event.data;
       const amountNaira = amount / 100;
+      const bookingId = metadata?.booking_id || reference;
 
-      console.log(`\n💳 Payment received: ${reference} - ₦${amountNaira}`);
+      console.log(`\n💳 Payment received: ${reference} (booking: ${bookingId}) - ₦${amountNaira}`);
 
-      const snap = await db.collection('booking_requests').doc(reference).get();
+      const snap = await db.collection('booking_requests').doc(bookingId).get();
       if (!snap.exists) {
-        console.log(`❌ Booking not found: ${reference}`);
+        console.log(`❌ Booking not found: ${bookingId}`);
         return res.sendStatus(200);
       }
 
       const booking = snap.data();
+      if (booking.status === 'completed') {
+        console.log(`ℹ️ Booking ${bookingId} already completed — skipping`);
+        return res.sendStatus(200);
+      }
       if (booking.status !== 'accepted') {
-        console.log(`⚠️ Booking not accepted`);
+        console.log(`⚠️ Booking ${bookingId} status is "${booking.status}" — expected accepted`);
         return res.sendStatus(200);
       }
 
@@ -961,16 +1131,19 @@ async function handlePaystackWebhook(req, res) {
       console.log(`   You get: ₦${campusmove_commission.toFixed(2)} (10%)`);
 
       // Mark completed
-      await db.collection('booking_requests').doc(reference).update({
+      await db.collection('booking_requests').doc(bookingId).update({
         status: 'completed',
         paid_at: Date.now(),
         paid_at_readable: formatDate(Date.now()),
         payment_reference: reference,
+        payment_status: 'paid',
+        amount_paid: amountNaira,
       });
 
       // Record for your revenue tracking
-      await db.collection('campusmove_revenue').doc(reference).set({
-        booking_id: reference,
+      await db.collection('campusmove_revenue').doc(bookingId).set({
+        booking_id: bookingId,
+        paystack_reference: reference,
         student_chatId: booking.student_chatId,
         driver_chatId: booking.accepted_driver_chatId,
         amount_paid: amountNaira,
@@ -1015,7 +1188,7 @@ async function handlePaystackWebhook(req, res) {
       await sendMsg(booking.student_chatId, 
         `✅ *Payment Confirmed!*\n\n` +
         `₦${amountNaira} received\n` +
-        `Request: \`${reference}\`\n\n` +
+        `Request: \`${bookingId}\`\n\n` +
         `Your ride is confirmed!\n` +
         `Driver details incoming soon.\n\n` +
         `Type MENU.`
@@ -1025,7 +1198,7 @@ async function handlePaystackWebhook(req, res) {
       await sendMsg(booking.accepted_driver_chatId, 
         `💰 *Payment Received!*\n\n` +
         `You earn: ₦${Math.round(driver_receives)}\n` +
-        `Request: \`${reference}\`\n\n` +
+        `Request: \`${bookingId}\`\n\n` +
         `Payment completed! Head to pickup.\n\n` +
         `Type MENU.`
       ).catch(() => {});
@@ -1103,6 +1276,107 @@ app.get('/api/diagnose', async (req, res) => {
   res.json(diagnosis);
 });
 
+app.get('/api/diagnose/paystack', async (_req, res) => {
+  const diagnosis = {
+    timestamp: formatDate(Date.now()),
+    checks: {},
+  };
+
+  const secret = getPaystackSecret();
+  diagnosis.checks.credentials_set = {
+    pass: !!secret,
+    detail: secret ? 'Secret key found' : 'PAYSTACK_SECRET_KEY MISSING',
+  };
+
+  try {
+    const response = await axios.get('https://api.paystack.co/bank', {
+      headers: { Authorization: `Bearer ${secret}` },
+      timeout: 5000,
+    });
+    diagnosis.checks.api_connectivity = {
+      pass: true,
+      detail: `Connected. Retrieved ${response.data.data.length} banks.`,
+    };
+  } catch (error) {
+    diagnosis.checks.api_connectivity = {
+      pass: false,
+      detail: error.response?.data?.message || error.message,
+    };
+  }
+
+  try {
+    await axios.post(
+      'https://api.paystack.co/subaccount',
+      {
+        business_name: 'TEST_ACCOUNT_DO_NOT_USE',
+        settlement_bank: '058',
+        account_number: '0000000000',
+        percentage_charge: 10,
+      },
+      {
+        headers: { Authorization: `Bearer ${secret}` },
+        timeout: 5000,
+      }
+    );
+    diagnosis.checks.subaccount_api = {
+      pass: false,
+      detail: 'Unexpected: test subaccount was created',
+    };
+  } catch (error) {
+    const msg = error.response?.data?.message || error.message;
+    diagnosis.checks.subaccount_api = {
+      pass: msg.toLowerCase().includes('account') || msg.toLowerCase().includes('invalid'),
+      detail: msg,
+    };
+  }
+
+  const allPass = Object.values(diagnosis.checks).every((c) => c.pass);
+  diagnosis.status = allPass ? '✅ All checks passed' : '❌ Some checks failed';
+  diagnosis.action = allPass
+    ? 'Ready to register drivers and take payments'
+    : 'Fix Paystack issues above before going live';
+
+  res.json(diagnosis);
+});
+
+app.get('/api/diagnose/drivers', async (_req, res) => {
+  try {
+    const drivers = await db.collection('drivers').get();
+    const stats = {
+      total: drivers.size,
+      with_subaccount: 0,
+      without_subaccount: [],
+      list: [],
+    };
+
+    drivers.forEach((doc) => {
+      const d = doc.data();
+      if (d.subaccount_code) {
+        stats.with_subaccount++;
+      } else {
+        stats.without_subaccount.push({
+          chatId: doc.id,
+          name: d.name,
+          registered_at: d.registered_at,
+        });
+      }
+      stats.list.push({
+        chatId: doc.id,
+        name: d.name,
+        bank: d.bank_code,
+        account: d.account_number ? `****${String(d.account_number).slice(-4)}` : null,
+        has_subaccount: !!d.subaccount_code,
+        paystack_linked: !!d.paystack_linked,
+        registered_at: formatDate(d.registered_at),
+      });
+    });
+
+    res.json(stats);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════════
 // TELEGRAM MESSAGE LISTENER
 // ═══════════════════════════════════════════════════════════════════════════════════
@@ -1125,29 +1399,6 @@ bot.on('message', async (msg) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════════
-// DRIVER REGISTRATION (when registering as driver)
-// ═══════════════════════════════════════════════════════════════════════════════════
-
-// Add this to handleState for driver registration:
-// if (state === 'DRIVER_REGISTER_NAME') {
-//   const name = inp.trim();
-//   if (name.length < 2) return 'Name too short.';
-//   
-//   await db.collection('drivers').doc(String(chatId)).set({
-//     chatId: String(chatId),
-//     name: name,
-//     vehicle_type: 'Not set',
-//     rating: 0,
-//     total_rides: 0,
-//     registered_at: Date.now(),
-//     registered_at_readable: formatDate(Date.now()),
-//   });
-//   
-//   await clearSession(chatId);
-//   return `✅ Registered as ${name}!\n\nType MENU to start!`;
-// }
-
-// ═══════════════════════════════════════════════════════════════════════════════════
 // START SERVER
 // ═══════════════════════════════════════════════════════════════════════════════════
 
@@ -1157,6 +1408,8 @@ app.listen(PORT, () => {
   console.log(`✅ Server on port ${PORT}`);
   console.log(`📊 Stats: GET /api/admin/stats`);
   console.log(`🔍 Diagnose: GET /api/diagnose`);
+  console.log(`🔐 Paystack: GET /api/diagnose/paystack`);
+  console.log(`🚗 Drivers: GET /api/diagnose/drivers`);
   console.log(`💳 Webhook: POST /api/paystack/webhook\n`);
 });
 
